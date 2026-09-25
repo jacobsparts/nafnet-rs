@@ -3,8 +3,9 @@
 One of the [lightgpu inference engines](https://github.com/jacobsparts/lightgpu).
 The family also includes [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
 [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) and
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs), all
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs),
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
+[maxim-rs](https://github.com/jacobsparts/maxim-rs), all
 built on the [lightgpu toolkit](https://github.com/jacobsparts/lightgpu);
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
 cleaning up product photos that drives them all.
