@@ -203,8 +203,11 @@ with a GTX 1080 (Pascal, sm_61):
 | GPU | **0.70-0.72 s**, 250 MB peak RSS | 1.68 s |
 | CPU | **2.2-2.3 s**, 37 s user time, 1.34 GB peak RSS | 3.46 s |
 
-The CPU figure moves with machine load (24 hardware threads are in play); the
-user time and the peak RSS are the stable numbers.
+Both figures move with machine load (24 hardware threads are in play, and other
+builds are often running); the GPU number has been seen from 0.69 s to 0.75 s
+and the CPU number from 2.2 s to 2.9 s for outputs that are byte-identical. The
+user time and the peak RSS are the stable numbers, which is why they are quoted
+alongside.
 
 `--profile` (a development build) reports per-kernel GPU time, longest first.
 The single largest cost
