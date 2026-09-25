@@ -19,7 +19,9 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 ```
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
-  hand-written kernels, selected at run time with `--device cpu|gpu`.
+  hand-written kernels. The GPU is used when the CUDA driver can be brought up
+  and the CPU path otherwise, so one binary covers a machine with no NVIDIA
+  driver at all; `--device cpu|gpu` overrides that choice.
 * 1.59 MiB binary (1,666,880 bytes), statically linked except `libc` and
   `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
   with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
@@ -38,7 +40,7 @@ carry the CPU backend; the difference is whether the CUDA sections are in them.
 
 | asset | contents | notes |
 |---|---|---|
-| `nafnet-linux-x86_64` | CPU + CUDA, selected with `--device` | any x86-64 Linux with glibc ≥ 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+); the GPU path needs an NVIDIA driver and a compute capability 6.1+ GPU |
+| `nafnet-linux-x86_64` | CPU + CUDA, auto-selected | any x86-64 Linux with glibc ≥ 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CUDA sections do not oblige you to have a driver: with none, the CPU path runs and says so. The GPU path needs a compute capability 6.1+ GPU |
 | `nafnet-linux-x86_64-cpu-only` | CPU only | same, but nothing NVIDIA-related is ever touched - `--device gpu` is refused rather than failing obscurely |
 | the 5 `*.safetensors` checkpoints | deblur (GoPro, REDS) and denoise (SIDD), width 32 and 64 | see Choosing a checkpoint |
 
@@ -100,11 +102,17 @@ nafnet -m model.safetensors -i in.png -o out.png --device cpu
 ```
 
 ```
--m, --model <path>    converted .safetensors checkpoint
+-m, --model <path>    converted .safetensors checkpoint (see tools/convert.py)
 -i, --input <path>    input PNG, or - for stdin (default: stdin)
 -o, --output <path>   output PNG, or - for stdout (default: stdout)
-    --device <dev>    gpu or cpu
+    --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
+                      brought up, cpu otherwise; a CPU-only build is always
+                      cpu)
+    --cpu             same as --device cpu
+    --gpu             same as --device gpu, and refuses to fall back
 -q, --quiet           no progress output
+-h, --help            this text
+-V, --version         print the version
 ```
 
 Nothing else is in a release binary. There is no `--tile` (other engines in the
