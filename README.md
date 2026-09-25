@@ -32,7 +32,8 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 ## Download
 
 Prebuilt binaries and the converted checkpoints are attached to the
-[releases](https://github.com/jacobsparts/nafnet-rs/releases):
+[releases](https://github.com/jacobsparts/nafnet-rs/releases). Both binaries
+carry the CPU backend; the difference is whether the CUDA sections are in them.
 
 | asset | contents | notes |
 |---|---|---|
@@ -42,16 +43,11 @@ Prebuilt binaries and the converted checkpoints are attached to the
 | `nafnet-gopro-width64.safetensors` | checkpoint: **deblur - quality** | GoPro, width 64 |
 | `nafnet-reds-width64.safetensors` | checkpoint: deblur | REDS, width 64; JPEG-damaged video |
 | `nafnet-sidd-width32.safetensors` | checkpoint: **denoise - speed** | SIDD, width 32 |
-| `nafnet-sidd-width64.safetensors` | checkpoint: **denoise - quality** | SIDD, width 64 |
-
-The engine reads these files directly, so nothing needs converting to try one.
+| `nafnet-gopro-width32.safetensors` etc. | checkpoint - see Choosing a checkpoint | deblur or denoise, speed or quality |
 
 ```sh
 ./nafnet-linux-x86_64 -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 ```
-
-**Both** binaries carry the CPU backend; the difference is whether the CUDA
-sections are in them.
 
 ## Build
 
@@ -71,26 +67,6 @@ asked for the GPU rather than failing obscurely. The kernels cover `sm_61`,
 `lightgpu` is a normal Cargo dependency on
 [its repository](https://github.com/jacobsparts/lightgpu), so a clone of this
 project builds on its own.
-
-### Development build
-
-The flags used to verify the engine are not in a release binary. They are behind
-a non-default feature, and a release build **refuses them by name** (with the
-rebuild command) rather than ignoring them:
-
-```sh
-cargo build --release --features dev
-```
-
-| flag | what it is for |
-|---|---|
-| `--dump <path>` | every intermediate activation as flat f32 plus a text index, for stage-by-stage comparison against `tools/reference.py`. Both backends implement it. |
-| `--raw <path> --size <h> <w>` | run the network on a `[3][h][w]` f32 plane instead of a PNG |
-| `--cuda-selftest` | compare each CUDA kernel against its CPU twin and exit |
-| `--profile` | per-kernel GPU time, longest first |
-
-`--raw` plus the reference's `--seed`/`--dump` gives both sides byte-identical
-input, so a per-stage difference is the model rather than the PNG loader.
 
 ## Choosing a checkpoint
 
@@ -119,21 +95,9 @@ clean sensor noise, is off its training distribution and can make the image
 worse rather than better. The PSNR figures are the upstream authors' own, not
 measured here.
 
-### Where the checkpoints come from
-
 The engine reads a `.safetensors` file converted from an official NAFNet
-checkpoint. The architecture constants are read from that file rather than
-inferred, so a converted file cannot be checked against the wrong config:
-
-```sh
-python3 tools/convert.py NAFNet-GoPro-width32.pth nafnet-gopro-width32.safetensors
-```
-
-`--task` (gopro, sidd, reds) and `--width` (32 or 64) are recorded in the file's
-metadata and default to being inferred from the weights and the file name, so
-converting an unlisted checkpoint needs no flags. The official `.pth` files come
-from [megvii-research/NAFNet](https://github.com/megvii-research/NAFNet) and are
-not redistributed here; the converted ones are attached to the releases.
+checkpoint with `tools/convert.py`, and the architecture constants come from the
+file itself, so a converted file cannot be checked against the wrong config.
 
 ## Usage
 
@@ -174,37 +138,8 @@ Both figures move with machine load, and the wider models are slower: the
 width-64 checkpoints take 1.9-2.1 s on the GPU and 8.5-14 s on the CPU for the
 same image. See Choosing a checkpoint.
 
-`--profile` (a development build) reports per-kernel GPU time longest first, and
-`NAFNET_CPU_PROFILE=1` does the same for the CPU. On both backends the single
-largest cost is the 1x1 convolution every NAFBlock uses four times, which is
-where the tiling effort went.
-
-## Verification
-
-The correctness record is `tools/reference.py` - a PyTorch NAFNet transcribed
-from the official sources - plus a checkpoint, which are the only two things the
-engine and the reference have in common. An engine agreeing with its own CPU twin
-would prove only that the two share a reading of the paper.
-
-* `--cuda-selftest` (development build) compares each CUDA kernel against its CPU
-  twin on identical inputs at real magnitudes, with a relative tolerance: 20
-  checks, 0 failed.
-* `--dump` (development build) writes every intermediate activation and the two
-  sides are compared **stage by stage, by name**; both backends implement it.
-* Against the reference at 32x32 the worst stage is 2.740e-02, and the two
-  backends agree with each other to 7.324e-03 worst stage of 128x128, which is
-  float32 accumulation order and nothing else. At 1280x725 the CPU and GPU output
-  PNGs are byte-identical.
-* A second geometry was validated the same way, because the checkpoints are not
-  all the same network: `nafnet-sidd-width32` has `enc [2,2,4,8]` and 12 middle
-  blocks against GoPro's `enc [1,1,1,28]` and 1. Its output is 119.5 dB from the
-  reference, the same order as the GoPro config's own, so a configuration the
-  engine was not written against behaves like the one it was.
-
-Where the two backends still differ, and why, is in
-[docs/NUMERICS.md](docs/NUMERICS.md) - along with the accumulation orders that
-must not be changed, and how to check an edit to a kernel.
-
+On both backends the largest single cost is the 1x1 convolution every NAFBlock
+uses four times, which is where the tiling effort went.
 ## Licence and attribution
 
 The Rust and CUDA code in this repository is licensed under the MIT license;
