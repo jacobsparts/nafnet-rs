@@ -24,8 +24,8 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
   `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
   with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
 * All five published NAFNet configurations, converted: deblur (GoPro, REDS) and
-  denoise (SIDD), each in a **width 32** build for speed and a **width 64** build
-  for quality. They are attached to the releases; see Choosing a checkpoint.
+  denoise (SIDD), in **width 32** builds for speed and **width 64** for quality.
+  They are attached to the releases; see Choosing a checkpoint.
 * **Both backends are faster than PyTorch on the machine this was built on**
   (see Performance).
 
@@ -151,16 +151,14 @@ nafnet -m model.safetensors -i in.png -o out.png --device cpu
 -q, --quiet           no progress output
 ```
 
-Nothing else is in a release binary. In particular `--tile` is **not** accepted:
-the other engines in the family take it, so a shared driver script may pass it,
-but this engine runs a whole image at once and a flag that is swallowed in
-silence would let you believe it had bounded the memory this process uses.
-Memory is bounded by an allocation plan instead (see `gpu::Plan`), and a release
-build answers `--tile` with that reason rather than a fake success.
+Nothing else is in a release binary. Other engines in the family accept `--tile`
+and this one does not: it runs a whole image at once, and a memory-control flag
+that was swallowed in silence would let a caller believe it had bounded this
+process's memory. Asking for it gets that reason rather than a fake success.
 
 The input is padded up to a multiple of 16 by reflection, which is what the
-reference does; zero-padding changes the first and last rows the network sees
-and therefore the output near the border.
+reference does. `--pad zero` is there for comparison; it changes the border rows
+the network sees, and so the output near the edge.
 
 ## Performance
 
