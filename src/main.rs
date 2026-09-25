@@ -611,21 +611,47 @@ fn main() {
                     if !quiet {
                         eprintln!("nafnet: device {}", g.device_name());
                     }
-                    let v = match forward_gpu(&g, &input_plane, padded.h, padded.w, dumped) {
-                        Ok(v) => v,
-                        Err(e) => {
+                    match forward_gpu(&g, &input_plane, padded.h, padded.w, dumped) {
+                        Ok(v) => {
+                            // AND THE REPORT IS GATED TOO: profiling is only
+                            // reachable with the development flags, so a release
+                            // build does not link the table.
+                            #[cfg(feature = "dev")]
+                            if let Some(p) = &g.profile {
+                                p.report();
+                            }
+                            v
+                        }
+                        // A PASS THAT RAN OUT OF MEMORY IS THE SAME KIND OF EVENT
+                        // AS A DRIVER THAT WOULD NOT LOAD, and until this existed
+                        // it was the one hole left in that rule: the plan for a
+                        // large image can want more VRAM than the card has (see
+                        // `gpu::Plan`, which allocates every buffer of the pass up
+                        // front), so `cuMemAlloc` failing there exited 1 on a
+                        // machine whose CPU would have finished the job.
+                        Err(e) if force_gpu => {
                             eprintln!("nafnet: {e}");
                             std::process::exit(1);
                         }
-                    };
-                    // AND THE REPORT IS GATED TOO: profiling is only reachable
-                    // with the development flags, so a release build does not
-                    // link the table.
-                    #[cfg(feature = "dev")]
-                    if let Some(p) = &g.profile {
-                        p.report();
+                        Err(e) => {
+                            eprintln!("nafnet: {e}");
+                            // the DEVICE BUFFERS GO BEFORE THE CPU PASS STARTS:
+                            // the plan holds the whole pass resident, and the CPU
+                            // twin then allocates several GB of its own, so the
+                            // two are never resident together.
+                            drop(g);
+                            eprintln!(
+                                "nafnet: falling back to the CPU backend (--gpu forces the GPU)"
+                            );
+                            match run_cpu(&weights, &input_plane, padded.h, padded.w, dumped) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("nafnet: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                     }
-                    v
                 }
                 // NAMING THE GPU IS A REQUEST; NOT NAMING IT IS NOT. gpu is the
                 // default, so a machine with no driver must still work: the

@@ -121,6 +121,38 @@ flag swallowed in silence would let a caller believe it had bounded this
 process's memory. Asking for `--tile` gets that reason rather than a fake
 success.
 
+## Large images
+
+The whole image is resident on the device at once, so VRAM grows with the
+input. Every buffer the pass will use is allocated up front, which makes the
+requirement predictable rather than a matter of luck:
+
+| checkpoint | 1280x853 | 1920x1080 | 2560x1440 |
+| --- | --- | --- | --- |
+| width 32 (Deblur/Denoise fast) | 3.6 GB | 6.7 GB | 11.9 GB |
+| width 64 (Deblur/Denoise best, Video Deblur) | 7.1 GB | 13.4 GB | 23.7 GB |
+
+Those are plan totals, and they are what the card must have FREE. On an 8 GB
+card that means the width-32 checkpoints run up to 1920x1080 and the width-64
+ones only to about 1344x752; past that the allocation fails. It is not a bug
+and there is no smaller setting - it is what running the whole image at once
+costs.
+
+So the failure is recovered rather than reported: **a pass that runs out of
+VRAM falls back to the CPU**, and says so on stderr:
+
+```
+nafnet: cuMemAlloc failed: CUDA_ERROR_OUT_OF_MEMORY
+nafnet: falling back to the CPU backend (--gpu forces the GPU)
+nafnet: 2048x1362 -> 2048x1362 in 9.30s
+```
+
+`--gpu` still refuses to fall back, for a caller who would rather fail than be
+quietly slow. The two backends agree to within 1/255 per channel, so the
+fallback changes the time and not the picture: on a 1920x1080 image, where both
+fit, the GPU takes 1.5 s and the CPU 6.6 s. The 2048x1362 run above spent 9.3 s
+and about 4 GB of host memory.
+
 The input is padded up to a multiple of 16 by reflection, which is what the
 reference does.
 
