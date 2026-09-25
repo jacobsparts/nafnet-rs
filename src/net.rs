@@ -686,7 +686,7 @@ pub fn channel_mean(input: &[f32], c: usize, hw: usize, out: &mut [f32]) {
 /// strides `hw` into `block` per-thread partials and then halves a tree, so its
 /// sum order is a function of the block size, and the twin takes the block as an
 /// argument so that the `--cuda-selftest` row measures the PORT rather than the
-/// summation order. It is the same choice maxim's CPU twin makes.
+/// summation order.
 pub fn channel_mean_block(input: &[f32], _c: usize, hw: usize, out: &mut [f32], block: usize) {
     let _p = prof_start("channel_mean");
     let n = hw as f32;
