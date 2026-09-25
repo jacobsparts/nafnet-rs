@@ -1,0 +1,43 @@
+[package]
+name = "nafnet"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, self-contained NAFNet image restoration (deblur, denoise) in Rust with CPU and CUDA backends"
+license = "MIT"
+repository = "https://github.com/jacobsparts/nafnet-rs"
+readme = "README.md"
+
+[[bin]]
+name = "nafnet"
+path = "src/main.rs"
+
+[features]
+# The default build supports both backends: `--device cpu` is pure Rust,
+# `--device gpu` uses the embedded CUDA fatbins. Building the CUDA feature
+# needs nvcc (set NVCC=/path/to/nvcc if it is not on PATH).
+default = ["cuda"]
+# Compiles cuda/nafnet.cu with nvcc and embeds the fatbins.
+cuda = []
+# DEVELOPMENT BUILDS ONLY. Adds `--raw`/`--size` (run the network on a plane of
+# floats instead of an image) and `--dump` (write every intermediate activation),
+# which are how a divergence is located by STAGE rather than by bisection on the
+# final image. Neither is any use to someone who wants a restored PNG, so a
+# release binary neither accepts them nor lists them. See tools/reference.py.
+#     cargo build --release --features dev
+dev = []
+
+[dependencies]
+png = "0.17"
+rayon = "1"
+# Driver layer, module/launch/buffer plumbing and the generic kernel set.
+lightgpu = { path = "../lightgpu" }
+
+[build-dependencies]
+# Compiles this engine's kernel family and the toolkit subset it calls.
+lightgpu-build = { path = "../lightgpu/build-support", package = "lightgpu-build" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"

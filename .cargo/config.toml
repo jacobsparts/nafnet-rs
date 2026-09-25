@@ -1,0 +1,18 @@
+# Target features for this crate's CPU fallback path.
+#
+# WHY `+fma`: the CUDA kernels are built by nvcc with `--fmad=true`, so their
+# `acc += w * x` is a single-rounded FFMA, and `src/net.rs` fuses the matching
+# multiply-adds so the two backends agree to the last bit. Without this flag the
+# fused form has NO instruction to use: rustc lowers `f32::mul_add` to a call
+# into `compiler_builtins`' soft-float `fmaf`, which also blocks vectorisation
+# and cost 5.6x on the CPU path for identical results (96 s -> 550 s of user time
+# for a 1280x725 image). `src/net.rs`'s `fma` helper therefore checks
+# `target_feature` and falls back to the plain multiply-add, so a build WITHOUT
+# this flag is still fast and still correct - it just rounds twice and so will
+# not match the GPU's arithmetic to the last bit.
+#
+# The cost of enabling it: the binary then requires an FMA-capable CPU (Intel
+# Haswell or AMD Piledriver, 2012 onwards). Nothing else here assumes more than
+# baseline x86-64.
+[build]
+rustflags = ["-C", "target-feature=+fma"]
