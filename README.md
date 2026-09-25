@@ -4,45 +4,45 @@ One of the [lightgpu inference engines](https://github.com/jacobsparts/lightgpu)
 The family also includes [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
 [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
 [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) and
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs); they
-share the [lightgpu toolkit](https://github.com/jacobsparts/lightgpu).
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs), all
+built on the [lightgpu toolkit](https://github.com/jacobsparts/lightgpu);
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
-cleaning up product photos that drives all of these engines.
+cleaning up product photos that drives them all.
 
 [NAFNet](https://github.com/megvii-research/NAFNet) image restoration - deblur
 and denoise - as a single self-contained binary. Feed it a PNG, get back a
-restored PNG. No Python at inference, no PyTorch, no ONNX Runtime, no CUDA
-toolkit needed to run it.
+restored PNG. No Python, PyTorch, ONNX Runtime, or CUDA toolkit needed at
+runtime.
 
 ```
 nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 ```
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
-  hand-written kernels. The GPU is used when the CUDA driver can be brought up
-  and the CPU path otherwise, so one binary covers a machine with no NVIDIA
-  driver at all; `--device cpu|gpu` overrides that choice.
-* 1.59 MiB binary (1,666,880 bytes), statically linked except `libc` and
-  `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
-  with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
+  hand-written kernels. The GPU is used when a CUDA driver is available and
+  the CPU path otherwise, so one binary covers a machine with no NVIDIA driver
+  at all; `--device cpu|gpu` overrides that choice.
+* 1.59 MiB binary, statically linked except `libc` and `libgcc_s`.
+  `libcuda.so.1` is `dlopen`ed, so no driver is required on disk. (The
+  CPU-only build is 1.05 MiB.)
 * All five published NAFNet configurations, converted from the official `.pth`
   files: deblur (GoPro, REDS) and denoise (SIDD), in **width 32** builds for
   speed and **width 64** for quality. They are attached to the releases; see
-  Choosing a checkpoint.
+  Choosing a checkpoint below.
 * **Both backends are faster than PyTorch on the machine this was built on**
-  (see Performance).
+  (see Performance below).
 
 ## Download
 
 Prebuilt binaries and the converted checkpoints are attached to the
 [releases](https://github.com/jacobsparts/nafnet-rs/releases). Both binaries
-carry the CPU backend; the difference is whether the CUDA sections are in them.
+run on the CPU; they differ only in whether CUDA support is compiled in.
 
 | asset | contents | notes |
 |---|---|---|
-| `nafnet-linux-x86_64` | CPU + CUDA, auto-selected | any x86-64 Linux with glibc ≥ 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CUDA sections do not oblige you to have a driver: with none, the CPU path runs and says so. The GPU path needs a compute capability 6.1+ GPU |
-| `nafnet-linux-x86_64-cpu-only` | CPU only | same, but nothing NVIDIA-related is ever touched - `--device gpu` is refused rather than failing obscurely |
-| the 5 `*.safetensors` checkpoints | deblur (GoPro, REDS) and denoise (SIDD), width 32 and 64 | see Choosing a checkpoint |
+| `nafnet-linux-x86_64` | CPU + CUDA, auto-selected | x86-64 Linux with glibc ≥ 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+); falls back to the CPU path when no NVIDIA driver is present. GPU path needs a compute capability 6.1+ GPU |
+| `nafnet-linux-x86_64-cpu-only` | CPU only | same, with nothing NVIDIA-related included - `--device gpu` is refused |
+| 5 `*.safetensors` checkpoints | deblur (GoPro, REDS) and denoise (SIDD), width 32 and 64 | see Choosing a checkpoint |
 
 ```sh
 ./nafnet-linux-x86_64 -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
@@ -58,8 +58,8 @@ cargo build --release --no-default-features
 
 The default build needs `nvcc` (set `NVCC=` if it is not on `PATH`) and produces
 one binary with both backends. The `--no-default-features` build contains only
-the CPU path, which reports `this build has no cuda feature; use --device cpu` if
-asked for the GPU rather than failing obscurely. The kernels cover `sm_61`,
+the CPU path, which reports `this build has no cuda feature; use --device cpu`
+if asked for the GPU rather than failing obscurely. The kernels cover `sm_61`,
 `sm_75`, `sm_80` and compute capability 8.0 PTX, so the GPU path runs on Pascal
 (GTX 10-series) through Ampere, and on anything newer via the PTX.
 
@@ -69,7 +69,7 @@ project builds on its own.
 
 ## Choosing a checkpoint
 
-Which task, and how much quality, are both decided by which file you pass to
+The task and the quality level are both decided by which file you pass to
 `-m`. There is no flag for either: the task picks the training distribution and
 the width picks quality against speed.
 
