@@ -410,6 +410,11 @@ fn main() {
         i += 1;
     }
 
+    // Only the GPU branch can fall back, and a CPU-only build has no GPU branch
+    // to reach, so it reads neither this nor that there is a GPU to be named -
+    // hence the discard.
+    let _ = force_gpu;
+
     let model_path = model_path.unwrap_or_else(|| {
         eprintln!("nafnet: --model is required (see tools/convert.py)");
         usage()
