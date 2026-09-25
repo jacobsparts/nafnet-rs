@@ -1,6 +1,6 @@
 [package]
 name = "nafnet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fast, self-contained NAFNet image restoration (deblur, denoise) in Rust with CPU and CUDA backends"
 license = "MIT"
@@ -29,12 +29,13 @@ dev = []
 [dependencies]
 png = "0.17"
 rayon = "1"
-# Driver layer, module/launch/buffer plumbing and the generic kernel set.
-lightgpu = { path = "../lightgpu" }
+# Driver layer, module/launch/buffer plumbing and the generic kernel set. A git
+# dependency rather than a path, so a clone of this repository builds on its own.
+lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
 
 [build-dependencies]
 # Compiles this engine's kernel family and the toolkit subset it calls.
-lightgpu-build = { path = "../lightgpu/build-support", package = "lightgpu-build" }
+lightgpu-build = { git = "https://github.com/jacobsparts/lightgpu.git", package = "lightgpu-build" }
 
 [profile.release]
 opt-level = 3
