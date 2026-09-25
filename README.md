@@ -23,9 +23,10 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 * 1.60 MiB binary (1,677,784 bytes), statically linked except `libc` and
   `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
   with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
-* All five published NAFNet configurations, converted: deblur (GoPro, REDS) and
-  denoise (SIDD), in **width 32** builds for speed and **width 64** for quality.
-  They are attached to the releases; see Choosing a checkpoint.
+* All five published NAFNet configurations, converted from the official `.pth`
+  files: deblur (GoPro, REDS) and denoise (SIDD), in **width 32** builds for
+  speed and **width 64** for quality. They are attached to the releases; see
+  Choosing a checkpoint.
 * **Both backends are faster than PyTorch on the machine this was built on**
   (see Performance).
 
@@ -90,10 +91,6 @@ interchangeable: a GoPro model run on a JPEG-damaged frame, or a REDS model on
 clean sensor noise, is off its training distribution and can make the image
 worse rather than better. The PSNR figures are the upstream authors' own, not
 measured here.
-
-The engine reads a `.safetensors` file converted from an official NAFNet
-checkpoint with `tools/convert.py`, and the architecture constants come from the
-file itself, so a converted file cannot be checked against the wrong config.
 
 ## Usage
 
