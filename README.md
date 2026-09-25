@@ -20,7 +20,7 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
   hand-written kernels, selected at run time with `--device cpu|gpu`.
-* 1.60 MiB binary (1,677,784 bytes), statically linked except `libc` and
+* 1.59 MiB binary (1,666,880 bytes), statically linked except `libc` and
   `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
   with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
 * All five published NAFNet configurations, converted from the official `.pth`
@@ -104,7 +104,6 @@ nafnet -m model.safetensors -i in.png -o out.png --device cpu
 -i, --input <path>    input PNG, or - for stdin (default: stdin)
 -o, --output <path>   output PNG, or - for stdout (default: stdout)
     --device <dev>    gpu or cpu
-    --pad <mode>      reflect (default, what the reference uses) or zero
 -q, --quiet           no progress output
 ```
 
@@ -115,8 +114,7 @@ process's memory. Asking for `--tile` gets that reason rather than a fake
 success.
 
 The input is padded up to a multiple of 16 by reflection, which is what the
-reference does. `--pad zero` is there for comparison; it changes the border rows
-the network sees, and so the output near the edge.
+reference does.
 
 ## Performance
 

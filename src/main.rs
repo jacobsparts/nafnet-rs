@@ -29,11 +29,11 @@ OPTIONS:
     -m, --model <path>    converted .safetensors checkpoint (see tools/convert.py)
     -i, --input <path>    input PNG, or - for stdin (default: stdin)
     -o, --output <path>   output PNG, or - for stdout (default: stdout)
-        --device <dev>    gpu or cpu (default: the CUDA build uses gpu, a
-                          CPU-only build uses cpu)
-        --pad <mode>      how the input is padded up to a multiple of 16:
-                          `reflect` (the default and what the reference uses) or
-                          `zero`
+        --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
+                          brought up, cpu otherwise; a CPU-only build is always
+                          cpu)
+        --cpu             same as --device cpu
+        --gpu             same as --device gpu, and refuses to fall back
     -q, --quiet           no progress output
     -h, --help            this text
     -V, --version         print the version"
@@ -63,7 +63,13 @@ these, and rejects them by name):
         --dump <path>     write every intermediate activation as a flat f32 file
                           plus a text index of `<name> <c> <h> <w> <offset>`
                           lines. BOTH backends implement it, and on the GPU it
-                          costs a device-to-host copy per stage."
+                          costs a device-to-host copy per stage.
+        --pad <mode>      fill the strip out to a multiple of 16 with `zero`
+                          instead of `reflect`. Reflection is part of what makes
+                          the output match the reference and is not cosmetic -
+                          zero-padding changes the border rows and columns the
+                          network sees - so this exists to measure that, not to
+                          be chosen."
     );
     std::process::exit(2)
 }
@@ -218,6 +224,33 @@ fn run_backend(
 
 /// One GPU pass with an optional stage dump.
 ///
+/// The CPU forward pass.
+///
+/// One function rather than a block inside the match, because it runs on two
+/// paths that must agree: `--device cpu`, and the fallback from a GPU that could
+/// not be brought up. A second copy would be a second place for the dump wiring
+/// to fall out of step.
+fn run_cpu(
+    weights: &weights::Weights,
+    plane: &[f32],
+    h: usize,
+    w: usize,
+    dump_path: Option<&str>,
+) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "dev")]
+    let r = net::forward_cpu_maybe_dump(weights, plane, h, w, dump_path);
+    // THE SINGLE CALL PATH FOR BOTH BUILDS, and the reason the dump path is a
+    // parameter rather than a second function: a release build reaches
+    // `dump_path == None` because no flag can set it, not because different code
+    // was compiled. `--raw` and `--dump` take this same route; see `run_backend`.
+    #[cfg(not(feature = "dev"))]
+    let r = {
+        let _ = dump_path;
+        net::forward_cpu(weights, plane, h, w)
+    };
+    r.map(|a| a.data)
+}
+
 /// THE SINGLE CALL PATH FOR BOTH BUILDS, so the release and the development
 /// binary run the same code and only the ARGUMENTS differ: a release build
 /// reaches `dump_path == None` because no flag can set it, not because a
@@ -262,7 +295,20 @@ fn main() {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut device = if cfg!(feature = "cuda") { "gpu" } else { "cpu" }.to_string();
+    // Set only when the caller NAMED the GPU. Without it, a GPU that cannot be
+    // brought up is not fatal: the engine falls back to the CPU backend, which
+    // is what lets one binary run on a machine with no NVIDIA driver at all.
+    let mut force_gpu = false;
+    // THE PAD FILL MODE: A FLAG IN A DEVELOPMENT BUILD, A CONSTANT OTHERWISE.
+    // Reflection is what the reference uses and what the output was verified
+    // with, and it is not cosmetic - `zero` changes the border rows and columns
+    // the network sees - so a release build offers no way to pick `zero`. The
+    // variable exists in both builds because `pad_to` needs an argument either
+    // way; only a `dev` build can change it.
+    #[cfg(feature = "dev")]
     let mut pad_mode = "reflect".to_string();
+    #[cfg(not(feature = "dev"))]
+    let pad_mode = "reflect".to_string();
     let mut quiet = false;
     // DEV-ONLY STATE, AND ITS ABSENCE IS WHAT KEEPS THE FLAGS OUT. A release
     // build has no flag that sets any of these, so the variables do not exist in
@@ -296,7 +342,21 @@ fn main() {
             "-m" | "--model" => model_path = Some(next(&mut i)),
             "-i" | "--input" => input = Some(next(&mut i)),
             "-o" | "--output" => output = Some(next(&mut i)),
-            "--device" => device = next(&mut i),
+            "--device" => {
+                device = next(&mut i);
+                force_gpu = device == "gpu";
+            }
+            "--cpu" => device = "cpu".to_string(),
+            "--gpu" => {
+                device = "gpu".to_string();
+                force_gpu = true;
+            }
+            // `--pad` IS A DEVELOPMENT FLAG: reflection is the only mode that
+            // matches the reference, so `zero` exists to measure what the
+            // padding contributes and not to be selected. A release build
+            // therefore refuses it rather than offering a way to be silently
+            // 0.2% wrong.
+            #[cfg(feature = "dev")]
             "--pad" => pad_mode = next(&mut i),
             "-q" | "--quiet" => quiet = true,
             // THE DEVELOPMENT FLAGS, AND ONLY A DEVELOPMENT BUILD HAS THEM. A
@@ -331,10 +391,10 @@ fn main() {
             // name rather than ignored - a script that asked for a dump and did
             // not get one must not carry on as if it had.
             #[cfg(not(feature = "dev"))]
-            "--dump" | "--raw" | "--size" | "--cuda-selftest" | "--profile" => {
+            "--dump" | "--raw" | "--size" | "--cuda-selftest" | "--profile" | "--pad" => {
                 eprintln!("nafnet: `{a}` is a development flag and this is a release build");
                 eprintln!("nafnet: rebuild with `cargo build --release --features dev` for --dump,");
-                eprintln!("nafnet: --raw, --size, --cuda-selftest and --profile");
+                eprintln!("nafnet: --raw, --size, --cuda-selftest, --profile and --pad");
                 std::process::exit(2);
             }
             "-h" | "--help" => usage(),
@@ -525,59 +585,81 @@ fn main() {
     let (padded, h, w) = pad_to(&img, mult, &pad_mode);
     let input_plane = padded.data.clone();
 
+    // A RELEASE BUILD CANNOT EVEN ASK FOR A DUMP: the flag does not exist there,
+    // so this is the const `None` rather than a runtime value. Deciding it here
+    // rather than inside the GPU branch is what lets the CPU path take it too -
+    // the CPU fallback must be able to dump, or the comparison the flag exists
+    // for could only be made against the GPU.
+    #[cfg(feature = "dev")]
+    let dumped = dump_path.as_deref();
+    #[cfg(not(feature = "dev"))]
+    let dumped: Option<&str> = None;
+
     let out: Vec<f32> = match device.as_str() {
         #[cfg(feature = "cuda")]
         "gpu" => {
-            // A RELEASE BUILD CANNOT EVEN ASK FOR A PROFILE OR A DUMP: the
-            // arguments do not exist there, so both are the const `false`/`None`
-            // rather than runtime flags, and the profile struct is never built.
-            let g = match gpu::Gpu::with_profile(&weights, geo.clone(), profile) {
-                Ok(g) => g,
-                Err(e) => {
+            // A RELEASE BUILD CANNOT EVEN ASK FOR A PROFILE: the argument does
+            // not exist there, so `profile` is the const `false` and the profile
+            // struct is never built.
+            match gpu::Gpu::with_profile(&weights, geo.clone(), profile) {
+                Ok(g) => {
+                    if !quiet {
+                        eprintln!("nafnet: device {}", g.device_name());
+                    }
+                    let v = match forward_gpu(&g, &input_plane, padded.h, padded.w, dumped) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("nafnet: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    // AND THE REPORT IS GATED TOO: profiling is only reachable
+                    // with the development flags, so a release build does not
+                    // link the table.
+                    #[cfg(feature = "dev")]
+                    if let Some(p) = &g.profile {
+                        p.report();
+                    }
+                    v
+                }
+                // NAMING THE GPU IS A REQUEST; NOT NAMING IT IS NOT. gpu is the
+                // default, so a machine with no driver must still work: the
+                // driver failing to come up is not an error unless the caller
+                // asked for the GPU by name.
+                Err(e) if force_gpu => {
                     eprintln!("nafnet: {e}");
                     std::process::exit(1);
                 }
-            };
-            if !quiet {
-                eprintln!("nafnet: device {}", g.device_name());
-            }
-            #[cfg(feature = "dev")]
-            let dumped = dump_path.as_deref();
-            #[cfg(not(feature = "dev"))]
-            let dumped: Option<&str> = None;
-            let v = match forward_gpu(&g, &input_plane, padded.h, padded.w, dumped) {
-                Ok(v) => v,
                 Err(e) => {
-                    eprintln!("nafnet: {e}");
-                    std::process::exit(1);
+                    if !quiet {
+                        eprintln!("nafnet: cuda: {e}");
+                        eprintln!("nafnet: falling back to the CPU backend (--gpu forces the GPU)");
+                    }
+                    match run_cpu(&weights, &input_plane, padded.h, padded.w, dumped) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("nafnet: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
-            };
-            // AND THE REPORT IS GATED TOO: profiling is only reachable with the
-            // development flags, so a release build does not link the table.
-            #[cfg(feature = "dev")]
-            if let Some(p) = &g.profile {
-                p.report();
             }
-            v
         }
+        // A CPU-only build is never asked for the GPU by this engine itself (it
+        // defaults to cpu), so reaching here means the caller named it; running
+        // the CPU engine instead would misreport what was measured.
         #[cfg(not(feature = "cuda"))]
         "gpu" => {
             eprintln!("nafnet: this build has no cuda feature; use --device cpu");
             std::process::exit(2);
         }
-        "cpu" => {
-            #[cfg(feature = "dev")]
-            let r = net::forward_cpu_maybe_dump(&weights, &input_plane, padded.h, padded.w, dump_path.as_deref());
-            #[cfg(not(feature = "dev"))]
-            let r = net::forward_cpu(&weights, &input_plane, padded.h, padded.w);
-            match r {
-                Ok(a) => a.data,
-                Err(e) => {
-                    eprintln!("nafnet: {e}");
-                    std::process::exit(1);
-                }
+        "cpu" => match run_cpu(&weights, &input_plane, padded.h, padded.w, dumped) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("nafnet: {e}");
+                std::process::exit(1);
             }
-        }
+        },
         other => {
             eprintln!("nafnet: unknown device `{other}` (gpu or cpu)");
             std::process::exit(2);
