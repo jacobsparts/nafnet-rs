@@ -20,7 +20,7 @@ nafnet -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
   hand-written kernels, selected at run time with `--device cpu|gpu`.
-* 1.60 MiB binary (1,677,728 bytes), statically linked except `libc` and
+* 1.60 MiB binary (1,677,784 bytes), statically linked except `libc` and
   `libgcc_s`. `libcuda.so.1` is `dlopen`ed, so the CPU path works on a machine
   with no NVIDIA driver at all. (The CPU-only build is 1.05 MiB.)
 * All five published NAFNet configurations, converted: deblur (GoPro, REDS) and
@@ -39,11 +39,7 @@ carry the CPU backend; the difference is whether the CUDA sections are in them.
 |---|---|---|
 | `nafnet-linux-x86_64` | CPU + CUDA, selected with `--device` | any x86-64 Linux with glibc ≥ 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+); the GPU path needs an NVIDIA driver and a compute capability 6.1+ GPU |
 | `nafnet-linux-x86_64-cpu-only` | CPU only | same, but nothing NVIDIA-related is ever touched - `--device gpu` is refused rather than failing obscurely |
-| `nafnet-gopro-width32.safetensors` | checkpoint: **deblur - speed** | GoPro, width 32 |
-| `nafnet-gopro-width64.safetensors` | checkpoint: **deblur - quality** | GoPro, width 64 |
-| `nafnet-reds-width64.safetensors` | checkpoint: deblur | REDS, width 64; JPEG-damaged video |
-| `nafnet-sidd-width32.safetensors` | checkpoint: **denoise - speed** | SIDD, width 32 |
-| `nafnet-gopro-width32.safetensors` etc. | checkpoint - see Choosing a checkpoint | deblur or denoise, speed or quality |
+| the 5 `*.safetensors` checkpoints | deblur (GoPro, REDS) and denoise (SIDD), width 32 and 64 | see Choosing a checkpoint |
 
 ```sh
 ./nafnet-linux-x86_64 -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
@@ -115,10 +111,11 @@ nafnet -m model.safetensors -i in.png -o out.png --device cpu
 -q, --quiet           no progress output
 ```
 
-Nothing else is in a release binary. Other engines in the family accept `--tile`
-and this one does not: it runs a whole image at once, and a memory-control flag
-that was swallowed in silence would let a caller believe it had bounded this
-process's memory. Asking for it gets that reason rather than a fake success.
+Nothing else is in a release binary. There is no `--tile` (other engines in the
+family have one): this engine runs a whole image at once, so a memory-control
+flag swallowed in silence would let a caller believe it had bounded this
+process's memory. Asking for `--tile` gets that reason rather than a fake
+success.
 
 The input is padded up to a multiple of 16 by reflection, which is what the
 reference does. `--pad zero` is there for comparison; it changes the border rows
@@ -140,6 +137,7 @@ same image. See Choosing a checkpoint.
 
 On both backends the largest single cost is the 1x1 convolution every NAFBlock
 uses four times, which is where the tiling effort went.
+
 ## Licence and attribution
 
 The Rust and CUDA code in this repository is licensed under the MIT license;
@@ -150,12 +148,12 @@ This is an independent reimplementation of the NAFNet architecture, which is by
 (© 2022 megvii-model). `tools/reference.py` is a PyTorch transcription of their
 network and is therefore a derived work, not covered by this repository's
 copyright; `tools/convert.py` transcribes their published configuration
-constants. The **checkpoints** are the NAFNet authors' work as well. The five converted
-`.safetensors` files attached to the releases are format conversions of the
-official `NAFNet-GoPro-width32`, `NAFNet-GoPro-width64`, `NAFNet-REDS-width64`,
-`NAFNet-SIDD-width32` and `NAFNet-SIDD-width64` `.pth` files, and are
-redistributed under the same MIT terms as the upstream release; the original
-`.pth` files are not redistributed here.
+constants. The **checkpoints** are the NAFNet authors' work as well: the five
+converted `.safetensors` files attached to the releases are format conversions of
+the official `NAFNet-GoPro-width32`, `NAFNet-GoPro-width64`, `NAFNet-REDS-width64`,
+`NAFNet-SIDD-width32` and `NAFNet-SIDD-width64` `.pth` files, redistributed under
+the same MIT terms as the upstream release. The original `.pth` files are not
+redistributed here.
 
 The upstream PSNR figures quoted above are from the NAFNet paper and repository
 and are reproduced as the authors report them, not measured here.
