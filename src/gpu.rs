@@ -37,7 +37,7 @@
 use crate::cuda::{grid_for, Cuda};
 use crate::net::Geometry;
 use crate::weights::Weights;
-use lightgpu::vm::{copy_d2d, Args, DevBuf, Event, Launch};
+use lightgpu::vm::{Args, DevBuf, Event, Launch};
 use std::cell::{Cell, RefCell};
 
 /// Threads per block for the flat elementwise kernels.
@@ -87,6 +87,27 @@ struct DA {
 }
 
 impl DA {
+    /// A view of the SAME allocation at a different shape.
+    ///
+    /// Used for the shared `pre`/`up` slots, whose buffer is sized to the largest
+    /// decoder level and is reused by every smaller one. The kernels index a
+    /// plane linearly by `h * w`, so a smaller shape is simply the front of the
+    /// same buffer - and because the levels are strictly ordered, the bytes a
+    /// smaller level writes are the bytes the level before it wrote, which is
+    /// what makes the sharing safe rather than merely small.
+    ///
+    /// `holds` stays false, so dropping this cannot free the slot.
+    fn resized(&self, c: usize, h: usize, w: usize) -> DA {
+        DA {
+            holds: false,
+            buf: DevBuf { ptr: self.buf.ptr, bytes: c * h * w * 4 },
+            c,
+            h,
+            w,
+            tag: "resized slot view",
+        }
+    }
+
     /// The same view metadata, without touching the allocation. Used to hand a
     /// slot's buffer to `block`, which reads and writes it in place.
     fn clone_meta(&self) -> DA {
@@ -481,6 +502,19 @@ impl Gpu {
     /// `lg_mul(a, b, y, n)` - SimpleGate, once the two halves are views.
     fn mul(&self, a_in: &DA, b_in: &DA, out: &DA) -> Result<(), String> {
         let n = out.n();
+        // THE COUNT COMES FROM THE OUTPUT AND THE KERNEL WALKS ALL THREE
+        // OPERANDS TO IT, so an operand of a different shape is read out of
+        // bounds rather than computed wrongly - and the driver reports the
+        // illegal address at the NEXT synchronising call, which is one kernel
+        // away from the cause. Two of this kernel's three call sites pass
+        // VIEWS, whose shape is not visible at the launch, so this is checked
+        // rather than assumed.
+        if a_in.n() != n || b_in.n() != n {
+            return Err(format!(
+                "lg_mul: {}x{}x{} and {}x{}x{} into {}x{}x{} - the count is the output's",
+                a_in.c, a_in.h, a_in.w, b_in.c, b_in.h, b_in.w, out.c, out.h, out.w
+            ));
+        }
         let mut a = Args::new();
         a.ptr(a_in.buf.ptr).ptr(b_in.buf.ptr).ptr(out.buf.ptr).i32(n as i32);
         self.go("lg_mul", grid_for(n, BLOCK), (BLOCK as u32, 1, 1), &mut a)
@@ -558,12 +592,41 @@ impl Gpu {
 
     /// The block, mirroring `net::block_forward` op for op.
     ///
-    /// Buffers: `t1` the normalised input, `t2` the 2c expansion, `t3` the
-    /// depthwise result, `g` the SimpleGate product, `t4` the sca result, `t5`
-    /// the branch output, `y` the first residual, plus `pooled`/`att` for the
-    /// attention. They are allocated once per forward pass and reused by every
-    /// block, and a block that no longer needs one - `res`, before the residual
-    /// became a single kernel - is not in `BlockScratch` at all.
+    /// THE SCRATCH IS SIZED BY THE LIVE SET, NOT BY THE ROLE LIST. `BlockScratch`
+    /// used to hold nine planes - t1 t2 t3 g y t4 t5 pooled att - all of them
+    /// resident for the whole pass, at every shape the graph visits. At
+    /// 2048x2048 level 0 that is nine 512 MiB planes = 4608 MiB for ONE level,
+    /// and 8928 MiB over the four, which was the single largest term in the
+    /// 13,856 MiB plan. The op list below needs FOUR: `t2` and `t3` (the 2c
+    /// expansion) are live together across the depthwise conv, and `t1` is live
+    /// with them; everything after SimpleGate works at half the channels and
+    /// reuses those. So the workspace is four planes of `2c` plus two [c]
+    /// vectors, and the scratch is scoped to the block that is running rather
+    /// than to the whole pass.
+    ///
+    /// EVERY REUSE BELOW IS A REUSE OF A DEAD BUFFER, and that is checkable by
+    /// reading the ops in order rather than by trusting the comments:
+    ///
+    ///   t1 = norm1(inp)              t1 live
+    ///   t2 = conv1(t1)               t1 dead, t2 live
+    ///   t3 = dwconv(t2)              t2 dead, t3 live
+    ///   g  = gate(t3)                t3 dead at the second read, g live
+    ///   pooled = mean(g)             needs a [c] vector
+    ///   att    = conv1x1(pooled)     `pooled` dead
+    ///   t1 = scale(g, att)           g dead, t1 live  (t1's old contents are dead)
+    ///   t2 = conv3(t1)               t1 dead, t2 live  (t2's old contents are dead)
+    ///   g  = residual(inp, t2, beta) t2 dead, g live   (g's old contents are dead)
+    ///   t1 = norm2(g)                g live for the residual at the end
+    ///   t2 = conv4(t1)               t1 dead, t2 live
+    ///   t3 = gate(t2)                t2 dead, t3 live
+    ///   t2 = conv5(t3)               t3 dead, t2 live
+    ///   out = residual(g, t2, gamma) both dead afterwards
+    ///
+    /// FOUR PLANES IS THE MINIMUM FOR THIS OP ORDER: `t2` and `t3` must coexist
+    /// across the depthwise conv and `t1` must coexist with `t2` across the 1x1,
+    /// which is three planes; the fourth is the input, which is also the
+    /// destination. Only `t2` and `t3` need to be `2c` wide - `t1` holds `c`
+    /// channels at every step, which is why it is sized at `c`.
     #[allow(clippy::too_many_arguments)]
     fn block(&self, prefix: &str, c: usize, cur: &mut DA, t: &BlockScratch) -> Result<(), String> {
         // A bisect switch: with NAFNET_SKIP_BLOCKS set, the block's launches are
@@ -586,7 +649,8 @@ impl Gpu {
         self.conv3x3_dw(&t.t2, &p("conv2.weight"), &p("conv2.bias"), dw, &t.t3)?;
 
         // SimpleGate: the two halves of the CHANNEL axis, multiplied. `t.t3`'s
-        // first `c` channels are the first half by construction.
+        // first `c` channels are the first half by construction, and both halves
+        // are read before `t.t3` is written again below.
         let g0 = Self::view(&t.t3.buf, half, h, wd, 0);
         let g1 = Self::view(&t.t3.buf, half, h, wd, half);
         self.mul(&g0, &g1, &t.g)?;
@@ -598,21 +662,38 @@ impl Gpu {
             let pin = DA { holds: false, buf: DevBuf { ptr: t.pooled.ptr, bytes: half * 4 }, c: half, h: 1, w: 1, tag: "pooled view" };
             self.conv1x1(&pin, &p("sca.1.weight"), Some(&p("sca.1.bias")), half, half, &t.att)?;
         }
-        self.channel_scale(&t.g, &t.att.buf, &t.t4)?;
+        // `t.t1`'s norm1 contents are dead here: the depthwise conv above read
+        // them into `t.t2`, and nothing since has read `t.t1`.
+        self.channel_scale(&t.g, &t.att.buf, &t.t1)?;
 
-        // conv3 back to c, then y = inp + t * beta.
-        self.conv1x1(&t.t4, &p("conv3.weight"), Some(&p("conv3.bias")), half, c, &t.t5)?;
-        // ONE KERNEL, NOT channel_scale + add: see `residual`.
-        self.residual(cur, &t.t5, &p("beta"), &t.y)?;
+        // conv3 back to c, then y = inp + t * beta. `t.t2`'s conv1 contents died
+        // at the depthwise conv, so the conv3 output reuses that plane.
+        self.conv1x1(&t.t1, &p("conv3.weight"), Some(&p("conv3.bias")), half, c, &t.t2)?;
+        // ONE KERNEL, NOT channel_scale + add: see `residual`. `t.t2` is dead
+        // after this, and `t.g` holds `y` for the FFN's second residual.
+        self.residual(cur, &t.t2, &p("beta"), &t.g)?;
 
-        // FFN: norm2, conv4, SimpleGate, conv5, scaled by gamma.
-        self.channel_layer_norm(&t.y, &p("norm2.weight"), &p("norm2.bias"), &t.t1)?;
+        // FFN: norm2, conv4, SimpleGate, conv5, scaled by gamma. `t.t1` is free
+        // again (its scale result was consumed by conv3).
+        self.channel_layer_norm(&t.g, &p("norm2.weight"), &p("norm2.bias"), &t.t1)?;
         self.conv1x1(&t.t1, &p("conv4.weight"), Some(&p("conv4.bias")), c, dw, &t.t2)?;
         let f0 = Self::view(&t.t2.buf, half, h, wd, 0);
         let f1 = Self::view(&t.t2.buf, half, h, wd, half);
-        self.mul(&f0, &f1, &t.g)?;
-        self.conv1x1(&t.g, &p("conv5.weight"), Some(&p("conv5.bias")), half, c, &t.t5)?;
-        self.residual(&t.y, &t.t5, &p("gamma"), cur)?;
+        // INTO A `c`-WIDE VIEW OF `t3`, AND THE WIDTH IS THE WHOLE POINT. `mul`
+        // takes its element count from the OUTPUT, so the output must be exactly
+        // `c*h*w`: a `2c`-wide output reads `2c*h*w` elements out of each half of
+        // `t2` and runs `c*h*w` elements past its end (the driver answers with
+        // CUDA_ERROR_ILLEGAL_ADDRESS at the copy that follows, which is not the
+        // launch that caused it - see the check in `mul`). Every plane in this
+        // workspace is `2c` wide except `t.g`, which holds `y`, so the gate
+        // product is written into the first half of `t3` - untouched since the
+        // depthwise conv, and wide enough either way.
+        self.mul(&f0, &f1, &Self::view(&t.t3.buf, half, h, wd, 0))?;
+        {
+            let prod = Self::view(&t.t3.buf, half, h, wd, 0);
+            self.conv1x1(&prod, &p("conv5.weight"), Some(&p("conv5.bias")), half, c, &t.t2)?;
+        }
+        self.residual(&t.g, &t.t2, &p("gamma"), cur)?;
         Ok(())
     }
 
@@ -688,23 +769,95 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         let geo = &self.geo;
         let levels = geo.levels();
-        let mut plan = Plan::new(&self.cuda, geo, h, wd)?;
+        // THE PLAN IS SIZED BEFORE ANYTHING IS ALLOCATED, which is the whole
+        // point: `PlanShape::of` is arithmetic and touches no CUDA state, so the
+        // engine can say what a pass will cost - and refuse it - before it has
+        // asked the driver for a single byte. `Plan::new` allocates exactly this
+        // list, so the number reported and the number allocated cannot drift.
+        let shape = PlanShape::of(geo, h, wd)?;
+        // AND THE PLAN IS CHECKED AGAINST FREE VRAM BEFORE THE FIRST
+        // `cuMemAlloc`. THIS IS THE WHOLE ANSWER TO A PASS THAT DOES NOT FIT:
+        // there is no CPU fallback behind it and no retry, because a fallback
+        // hides the reason - and the reason is actionable, while a silent switch
+        // to a 5 GiB host allocation on a machine with 8 GiB of RAM is not.
+        //
+        // THE NUMBERS ARE REPORTED IN MIB, NOT GiB, because the decision is made
+        // at a boundary a human has to be able to check against `nvidia-smi`.
+        let free = lightgpu::vm::free_vram().unwrap_or(usize::MAX);
+        // REPORTED EITHER WAY, AND BEFORE THE ALLOCATION: which plan this pass
+        // will run and against how much free memory is a property of the result,
+        // like the device line - so `--quiet` does not silence it, and a run that
+        // then fails for some other reason still says what it was trying to do.
+        eprintln!(
+            "nafnet: plan {} MiB ({} activations + {} workspace), {} MiB free",
+            shape.bytes / 1048576,
+            shape.slot_bytes / 1048576,
+            shape.workspace_bytes / 1048576,
+            free / 1048576,
+        );
+        let describe = |s: &PlanShape| {
+            format!(
+                "{} MiB ({} activations + {} workspace)",
+                s.bytes / 1048576,
+                s.slot_bytes / 1048576,
+                s.workspace_bytes / 1048576
+            )
+        };
+        if shape.bytes > free {
+            // ONE LINE PER FACT, AND NO INDENTATION: every line carries the
+            // engine's own prefix so a caller can strip it and show the rest
+            // verbatim. The first line says what happened and to what, the second
+            // the arithmetic, the third why it is a limit rather than a guess,
+            // and the fourth what the user can actually do about it.
+            return Err(format!(
+                "not enough device memory for a {}x{} pass\n\
+                 nafnet: the plan needs {}; {} MiB is free\n\
+                 nafnet: the plan is exact - it is what the driver would be asked for - so this is a hard limit, not a guess\n\
+                 nafnet: a smaller image, a narrower checkpoint, or a freer card is what fits",
+                wd,
+                h,
+                describe(&shape),
+                free / 1048576,
+            ));
+        }
+        let plan = Plan::new(&self.cuda, &shape).map_err(|e| {
+            // THE CHECK ABOVE CAN PASS AND THE ALLOCATION STILL FAIL: free VRAM
+            // is a total, and the driver has to find one CONTIGUOUS run for each
+            // buffer. So a failure here is reported with the same numbers plus
+            // the one fact that distinguishes it - the plan was supposed to fit -
+            // rather than as a bare `cuMemAlloc failed`.
+            if e.contains("OUT_OF_MEMORY") {
+                format!(
+                    "the plan for {}x{} ({}) did not fit after all, with {} MiB free\n\
+                     nafnet: {e}\n\
+                     nafnet: free VRAM is a total, and each buffer needs one contiguous run, so a fragmented card can refuse a plan the total says fits",
+                    wd, h, describe(&shape), free / 1048576
+                )
+            } else {
+                e
+            }
+        })?;
 
         // The input goes into its own slot in the plan, so it lives as long as
         // the residual add at the end needs it.
         plan.da("in").buf.upload(input)?;
+        // THE INTRO CONV WRITES STRAIGHT INTO `enc.0`. It used to write into a
+        // slot of its own and then `copy_d2d` into `enc.0` - a second
+        // full-resolution activation, plus a copy of it, for a value the copy
+        // reproduced byte for byte. The dump still reports it as `intro`, the
+        // name `tools/reference.py` uses, so the stage comparison is unchanged.
         {
             let cur = plan.da("in");
-            let out = plan.da("intro");
+            let out = plan.da("enc.0");
             self.conv3x3(cur, "intro.weight", Some("intro.bias"), 3, geo.width, out)?;
         }
-        self.snap("intro", plan.da("intro"), host, &mut dump)?;
+        self.snap("intro", plan.da("enc.0"), host, &mut dump)?;
 
-        // The ENCODER. `cur` names the activation in flight; `enc.{l}` is the
-        // level's own slot and `down.{l}` the folded one. Nothing is ever
-        // re-pointed: every transition is a copy between two distinct slots, so
-        // a slot's (c,h,w) is a fixed property of the plan.
-        plan.copy("intro", "enc.0")?;
+        // The ENCODER. `cur` names the activation in flight, and `enc.{l}` is
+        // ALSO the skip the decoder reads back and ALSO the next level's
+        // destination - see `PlanShape::of`. Nothing is ever re-pointed and
+        // nothing is copied: every transition is a kernel writing one slot
+        // while reading another.
         let mut cur = "enc.0".to_string();
         for l in 0..levels {
             let c = geo.width_at(l);
@@ -717,18 +870,22 @@ impl Gpu {
                 self.block(&prefix, c, &mut cur_da, t)?;
                 self.snap(&prefix, &cur_da, host, &mut dump)?;
             }
-            // The skip is its own slot: the encoder output is read again by the
-            // decoder, long after the downsample has run.
-            let skip_name = format!("skip.{l}");
-            plan.copy(&cur, &skip_name)?;
-            let down_name = format!("down.{l}");
+            // `cur` STAYS THE SKIP. The decoder reads this slot again and
+            // nothing between here and then writes it, so the copy that used to
+            // preserve it - and the second full-size allocation it preserved it
+            // into - are both gone.
+            let next = if l + 1 == levels {
+                "bottleneck".to_string()
+            } else {
+                format!("enc.{}", l + 1)
+            };
             {
                 let src = plan.da(&cur);
-                let dst = plan.da(&down_name);
+                let dst = plan.da(&next);
                 self.downsample(src, l, c, dst)?;
             }
-            self.snap(&format!("downs.{l}"), plan.da(&down_name), host, &mut dump)?;
-            cur = down_name;
+            self.snap(&format!("downs.{l}"), plan.da(&next), host, &mut dump)?;
+            cur = next;
         }
 
         let mid_c = geo.middle_width();
@@ -742,27 +899,28 @@ impl Gpu {
             self.snap(&prefix, &cur_da, host, &mut dump)?;
         }
 
-        // The DECODER. The first level takes the bottleneck, so its staging
-        // slot is the middle activation itself; the rest read `pre.{l-1}`,
-        // which is why `pre` and `up` are separate slots rather than one
-        // reuse-by-name trick.
+        // The DECODER, ON ONE `pre` AND ONE `up` FOR EVERY LEVEL. The shapes
+        // come from `pre_shape`/`up_shape` - the same two functions
+        // `PlanShape::of` sizes the slots with - so a view here is by
+        // construction inside the buffer the plan allocated.
+        //
+        // `cur_da` NAMES THE ACTIVATION IN FLIGHT AND IS REBOUND, NOT RE-NAMED:
+        // the decoder's input is the bottleneck at l = 0 and the previous
+        // level's `up` after that, and both are already DAs.
+        let mut cur_da = plan.da(&cur).clone_meta();
         for l in 0..levels {
             let c_after = geo.width_at(levels - 1 - l);
+            let (pc, ph, pw) = pre_shape(geo, h, wd, l);
+            let pre = plan.da("pre").resized(pc, ph, pw);
+            let (uc, uh, uw) = up_shape(geo, h, wd, l);
+            let up = plan.da("up").resized(uc, uh, uw);
             // 1x1 conv to 4x the channels (bias-free), sized 2*c_after, at the
             // resolution the shuffle will double.
-            let pre_name = format!("pre.{l}");
             {
-                let src = plan.da(&cur);
-                let dst = plan.da(&pre_name);
-                let c_before = src.c;
-                self.conv1x1(src, &format!("ups.{l}.0.weight"), None, c_before, c_before * 2, dst)?;
+                let c_before = cur_da.c;
+                self.conv1x1(&cur_da, &format!("ups.{l}.0.weight"), None, c_before, c_before * 2, &pre)?;
             }
-            let up_name = format!("up.{l}");
-            {
-                let src = plan.da(&pre_name);
-                let dst = plan.da(&up_name);
-                self.pixel_shuffle2(src, c_after, dst)?;
-            }
+            self.pixel_shuffle2(&pre, c_after, &up)?;
             // `ups.{l}` IS THE SHUFFLE OUTPUT, and the dump has to happen HERE:
             // before the skip add mutates this slot in place, and before the
             // decoder blocks rewrite it again. That is the stage
@@ -770,40 +928,31 @@ impl Gpu {
             // then `x = x + skips[-i-1]`), and snapping later compares a
             // post-decoder tensor against a pre-skip-add one - which reads as a
             // difference larger than either tensor's own peak.
+            self.snap(&format!("ups.{l}"), &up, host, &mut dump)?;
+            // The skip IS the encoder's slot for the mirrored level - see
+            // `PlanShape::of` for why there is no separate `skip.{l}` slot.
             {
-                let up = plan.da(&up_name);
-                self.snap(&format!("ups.{l}"), up, host, &mut dump)?;
+                let skip = plan.da(&format!("enc.{}", levels - 1 - l));
+                self.add(&up, skip, &up)?;
             }
-            let skip_level = levels - 1 - l;
-            let skip_name = format!("skip.{skip_level}");
-            {
-                let up = plan.da(&up_name);
-                let skip = plan.da(&skip_name);
-                self.add(up, skip, up)?;
-            }
-            // The decoder blocks run in place in the `up` slot at the PREVIOUS
-            // shape, so they get their own scratch keyed by the SHAPE the
-            // shuffle produced.
-            // A lookup, to fail here rather than inside the block loop if the
-            // plan never enumerated this shape.
-            let (hh, ww) = (plan.da(&up_name).h, plan.da(&up_name).w);
-            plan.scratch(c_after, hh, ww)?;
+            // The decoder blocks run in place in the `up` slot at THIS level's
+            // shape, so they get their own scratch keyed by that shape. A
+            // lookup, to fail here rather than inside the block loop if the plan
+            // never enumerated it.
+            plan.scratch(c_after, uh, uw)?;
             for b in 0..geo.dec_blk_nums[l] {
                 let prefix = format!("decoders.{l}.{b}");
-                let hh = plan.da(&up_name).h;
-                let ww = plan.da(&up_name).w;
-                let t = plan.scratch(c_after, hh, ww)?;
-                let mut cur_da = plan.da(&up_name).clone_meta();
-                self.block(&prefix, c_after, &mut cur_da, t)?;
-                self.snap(&prefix, &cur_da, host, &mut dump)?;
+                let t = plan.scratch(c_after, uh, uw)?;
+                let mut blk_da = up.clone_meta();
+                self.block(&prefix, c_after, &mut blk_da, t)?;
+                self.snap(&prefix, &blk_da, host, &mut dump)?;
             }
-            cur = up_name;
+            cur_da = up;
         }
 
         {
-            let cur_da = plan.da(&cur);
             let out = plan.da("ending");
-            self.conv3x3(cur_da, "ending.weight", Some("ending.bias"), geo.width, 3, out)?;
+            self.conv3x3(&cur_da, "ending.weight", Some("ending.bias"), geo.width, 3, out)?;
             let din = plan.da("in");
             self.add(out, din, out)?;
         }
@@ -1280,6 +1429,151 @@ impl Gpu {
     }
 }
 
+/// Every device buffer one forward pass will use, as SHAPES rather than
+/// allocations.
+///
+/// THIS IS THE ARITHMETIC AND NOTHING ELSE - no CUDA call, no `cuMemAlloc` - so
+/// it can be run before there is anything to allocate. That is what lets the
+/// engine answer "will this fit on this card?" and say so, instead of dying
+/// inside a launch with `CUDA_ERROR_OUT_OF_MEMORY` half a second in. `Plan::new`
+/// allocates from exactly this list, so the number the engine reports and the
+/// bytes it then asks the driver for cannot drift apart.
+///
+/// It is also where the plan's two invariants are checked, because both are
+/// properties of the LIST and not of the driver: names must be unique (a
+/// duplicate would mean two slots for one buffer) and a shape may not be
+/// enumerated twice (two workspaces for one shape).
+pub struct PlanShape {
+    /// `(name, c, h, w)`, in the order they are enumerated.
+    slots: Vec<(String, usize, usize, usize)>,
+    /// One workspace per distinct block shape, as `(c, h, w)`. THE POOL IS THE
+    /// LARGEST OF THESE, not their sum - see `Plan::new`.
+    scratch: Vec<(usize, usize, usize)>,
+    /// Bytes the pass holds at once: every slot, plus ONE workspace pool.
+    pub bytes: usize,
+    /// The activation slots alone. Kept separate because the two halves fail
+    /// differently - activations scale with the image and the level count, the
+    /// workspace with one block - so a message that reports only the total
+    /// cannot say which of them to attack.
+    pub slot_bytes: usize,
+    /// The workspace pool alone.
+    pub workspace_bytes: usize,
+}
+
+impl PlanShape {
+    pub fn of(geo: &Geometry, h: usize, wd: usize) -> Result<PlanShape, String> {
+        // A DUPLICATE NAME WOULD FREE THE FIRST ALLOCATION, and that is why this
+        // is an error rather than an overwrite: two slots for one buffer means
+        // the executor can read a name it has already written. Names must be
+        // unique.
+        fn put(
+            slots: &mut Vec<(String, usize, usize, usize)>,
+            n: &str,
+            c: usize,
+            hh: usize,
+            ww: usize,
+        ) -> Result<(), String> {
+            if slots.iter().any(|(m, ..)| m == n) {
+                return Err(format!("plan slot `{n}` was enumerated twice"));
+            }
+            slots.push((n.to_string(), c, hh, ww));
+            Ok(())
+        }
+        // ONE workspace per distinct block shape. A second entry for a shape
+        // would be a second allocation for the same work, which is the whole
+        // memory cost this plan exists to bound.
+        fn workspace_for(
+            scratch: &mut Vec<(usize, usize, usize)>,
+            c: usize,
+            hh: usize,
+            ww: usize,
+        ) {
+            if !scratch.iter().any(|k| *k == (c, hh, ww)) {
+                scratch.push((c, hh, ww));
+            }
+        }
+
+        let levels = geo.levels();
+        let mut slots: Vec<(String, usize, usize, usize)> = Vec::new();
+        let mut scratch: Vec<(usize, usize, usize)> = Vec::new();
+
+        // ONE SLOT PER LEVEL, CARRYING THREE ROLES: the encoder's activation, the
+        // skip the decoder reads back, and the downsample's destination. The
+        // chain is `enc.{l}` written by level l's blocks (in place), read by
+        // level l's downsample, and read again by the decoder - and NOTHING
+        // writes it in between, so one buffer holds all three. Naming them
+        // separately cost a `copy_d2d` per level plus a second full-size
+        // allocation: at 2048x2048 those copies were 1920 MiB of a 13.5 GiB plan,
+        // and 2432 MiB counting the input and the intro slot the same way.
+        let (mut ch, mut cw) = (h, wd);
+        for l in 0..levels {
+            let c = geo.width_at(l);
+            workspace_for(&mut scratch, c, ch, cw);
+            put(&mut slots, &format!("enc.{l}"), c, ch, cw)?;
+            let (mc, mh, mw) = up_shape(geo, h, wd, l);
+            workspace_for(&mut scratch, mc, mh, mw);
+            ch /= 2;
+            cw /= 2;
+        }
+        // THE BOTTLENECK IS ITS OWN SLOT: the middle blocks run in place on the
+        // last downsample's output, at `middle_width()` channels on the smallest
+        // plane, which is a shape no encoder level has.
+        put(&mut slots, "bottleneck", geo.middle_width(), ch, cw)?;
+        workspace_for(&mut scratch, geo.middle_width(), ch, cw);
+        put(&mut slots, "in", 3, h, wd)?;
+        put(&mut slots, "ending", 3, h, wd)?;
+        // ONE `pre` AND ONE `up`, BOTH SIZED TO THE LARGEST DECODER LEVEL.
+        //
+        // They were per level, which was 2432 MiB of the plan at 2048x2048 for
+        // the two of them. What makes one pair enough is that the decoder's
+        // stages are STRICTLY ORDERED: level l's shuffle finishes reading `pre`
+        // before level l+1's 1x1 writes it, and level l's blocks finish with
+        // `up` before level l+1's shuffle writes it. So the largest shape's
+        // buffer serves every level, and a smaller level simply uses the front
+        // of it.
+        //
+        // THE VIEWS ARE BUILT FROM THE PLAN'S OWN SHAPES, and not from the
+        // running counters, which is what makes a shared slot safe: every level
+        // writes the same bytes of the same allocation that the level before it
+        // wrote, so there is no address for the driver to recycle and no
+        // lifetime for the borrow checker to get wrong.
+        let (pc, ph, pw) = (0..levels)
+            .map(|l| pre_shape(geo, h, wd, l))
+            .max_by_key(|(c, hh, ww)| c * hh * ww)
+            .expect("levels is never zero");
+        put(&mut slots, "pre", pc, ph, pw)?;
+        let (uc, uh, uw) = (0..levels)
+            .map(|l| up_shape(geo, h, wd, l))
+            .max_by_key(|(c, hh, ww)| c * hh * ww)
+            .expect("levels is never zero");
+        put(&mut slots, "up", uc, uh, uw)?;
+        // The executor's slot set is exactly: in, enc.{l}, bottleneck, pre, up,
+        // ending - nothing else is allocated during the pass, and `in` is the
+        // only slot the whole pass holds for its own sake.
+
+        let mut slot_bytes = 0usize;
+        for (_, c, hh, ww) in &slots {
+            slot_bytes += c * hh * ww * 4;
+        }
+        // The WORKSPACE IS COUNTED ONCE, because one pool serves every shape -
+        // see `Plan::new`. Counting one per shape is what the engine did before
+        // the pool existed, and it is what made 2048x2048/w32 need 9952 MiB when
+        // the same plan in one pool needs 6600.
+        let workspace_bytes = scratch
+            .iter()
+            .map(|(c, hh, ww)| workspace_floats(*c, *hh, *ww) * 4)
+            .max()
+            .unwrap_or(0);
+        Ok(PlanShape {
+            slots,
+            scratch,
+            bytes: slot_bytes + workspace_bytes,
+            slot_bytes,
+            workspace_bytes,
+        })
+    }
+}
+
 /// Every device buffer one forward pass will use, allocated up front.
 ///
 /// THE BUG THIS EXISTS TO KILL: with activations allocated per stage and block
@@ -1297,110 +1591,43 @@ impl Gpu {
 /// one workspace per distinct block shape. Both are keyed by name/shape, and a
 /// shape is never allocated twice.
 struct Plan {
+    /// THE WORKSPACE POOL, AND IT IS WHY EVERY `BlockScratch` IS A SET OF VIEWS:
+    /// one allocation, sized to the largest block shape, handed to each shape at
+    /// an offset. It is held only so that it outlives the views into it - the
+    /// `Drop` order inside `Plan` would otherwise be able to free it first.
+    _pool: DevBuf,
     slots: std::collections::HashMap<String, DA>,
     scratch: std::collections::HashMap<(usize, usize, usize), BlockScratch>,
 }
 
 impl Plan {
-    fn new(cuda: &Cuda, geo: &Geometry, h: usize, wd: usize) -> Result<Plan, String> {
-        let levels = geo.levels();
-        let mut slots: std::collections::HashMap<String, DA> = std::collections::HashMap::new();
+    /// Allocate every buffer `shape` names. The shapes - and therefore the byte
+    /// total the engine reports before it launches anything - come from
+    /// `PlanShape::of`, which is pure; this function only turns them into
+    /// allocations.
+    fn new(cuda: &Cuda, shape: &PlanShape) -> Result<Plan, String> {
+        // ONE POOL FOR EVERY WORKSPACE, SIZED TO THE LARGEST. The workspaces do
+        // not overlap in time - level l's blocks run before level l+1's, and the
+        // decoder's blocks reuse the encoder's shapes - so a single allocation
+        // serves all of them and the plan pays for one, not for the sum. That is
+        // the difference between 6944 MiB of workspace and 3584 MiB at
+        // 2048x2048/w32, and it is why `PlanShape::bytes` counts the maximum
+        // rather than the total.
+        let pool_floats = shape
+            .scratch
+            .iter()
+            .map(|(c, hh, ww)| workspace_floats(*c, *hh, *ww))
+            .max()
+            .unwrap_or(0);
+        let pool = cuda.buf(pool_floats)?;
         let mut scratch = std::collections::HashMap::new();
-        let mut put = |n: &str, c: usize, hh: usize, ww: usize| -> Result<(), String> {
-            // A DUPLICATE NAME WOULD FREE THE FIRST ALLOCATION: `insert` returns
-            // the old value and dropping it calls cuMemFree, so a name the pass
-            // still reads would point at memory the driver may hand to someone
-            // else. Names must be unique, so make a collision an error rather
-            // than a silent free.
-            if let Some(old) = slots.insert(n.to_string(), DA::new(c, hh, ww)?) {
-                return Err(format!(
-                    "plan slot `{n}` was allocated twice ({}x{}x{} then {}x{}x{})",
-                    old.c, old.h, old.w, c, hh, ww
-                ));
-            }
-            Ok(())
-        };
-        // One block workspace per shape the graph will actually use, and one
-        // activation slot per name the executor asks for. `h`/`wd` are the
-        // PADDED geometry, so every level is an exact halving.
-        let (mut ch, mut cw) = (h, wd);
-        for l in 0..levels {
-            let c = geo.width_at(l);
-            let key = (c, ch, cw);
-            if !scratch.contains_key(&key) {
-                scratch.insert(key, BlockScratch::new(cuda, c, ch, cw)?);
-            }
-            put(&format!("enc.{l}"), c, ch, cw)?;
-            put(&format!("skip.{l}"), c, ch, cw)?;
-            // `pre.{l}` IS THE PRE-SHUFFLE BUFFER: the decoder's 1x1 conv writes
-            // `2*width_at(ml)` channels into it and `nf_pixel_shuffle2` reads
-            // `4*c_after` = `4*width_at(ml)` planes out of it, so it must be
-            // exactly that many channels AT HALF THE `up` RESOLUTION. Sizing it
-            // by the encoder's `c` at the encoder's resolution wrote the
-            // expansion past the allocation and read the shuffle from the wrong
-            // planes - which is a wrong image, not a crash.
-            let ml = levels - 1 - l;
-            // THE PRE-SHUFFLE SLOT IS `2 * c_before` CHANNELS WIDE, at the
-            // resolution one halving below the `up` slot it feeds. The decoder's
-            // 1x1 conv at level l reads `cur` - which at l is the level ABOVE the
-            // mirrored one, `width_at(levels-l)`, except at l=0 where it is the
-            // middle, `width_at(levels)` - and writes `c_before * 2` channels;
-            // `nf_pixel_shuffle2` then reads `4 * c_after` planes back out.
-            // Sizing it by `width_at(levels-1-l)` happens to coincide at l=0
-            // (where the middle is twice that level) and is off by a factor of
-            // two everywhere else, which is why width 8 looked perfect and every
-            // larger width did not.
-            let (ph, pw) = ((h >> (ml + 1)).max(1), (wd >> (ml + 1)).max(1));
-            put(&format!("pre.{l}"), 2 * geo.width_at(levels - l), ph, pw)?;
-            // `up.{l}` IS THE DECODER'S SLOT FOR THE SAME LEVEL INDEX, AND BOTH
-            // ITS AXES COME FROM THE MIRRORED LEVEL. The decoder walks the
-            // levels in reverse: at l its channel count is
-            // `width_at(levels-1-l)` and its resolution is the encoder's
-            // level-(levels-1-l) resolution, NOT `2*ch` from the running loop
-            // counter. The CPU reference's own dump fixes the rule -
-            // `ups.0 64 4 4`, `ups.1 32 8 8`, `ups.2 16 16 16`, `ups.3 8 32 32`
-            // - which is `(width_at(levels-1-l), h >> (levels-1-l), wd >> ...)`.
-            // Getting this wrong is not an error: the decoder runs, at the wrong
-            // resolution, and the output is a different image.
-            let (uh, uw) = ((h >> ml).max(1), (wd >> ml).max(1));
-            put(&format!("up.{l}"), geo.width_at(ml), uh, uw)?;
-            // THE DOWNSAMPLE OUTPUT IS HALF THE RESOLUTION, TWICE THE CHANNELS.
-            // Allocating it at `(2c, ch, cw)` - the source resolution with the
-            // doubled channel count - made every `down.{l}` four times its real
-            // size, so `cur` carried a shape the network does not have and the
-            // next level's `copy down.{l} -> skip.{l+1}` was refused by
-            // `Plan::copy`'s own consistency guard. `ch`/`cw` halve after this,
-            // so the next iteration's `key` already covers this shape and the
-            // separate `key2` scratch set was both wrong and redundant.
-            let (dh, dwd) = ((ch / 2).max(1), (cw / 2).max(1));
-            put(&format!("down.{l}"), 2 * c, dh, dwd)?;
-            // THE DECODER'S BLOCK SHAPE IS ITS OWN KEY, at the mirrored level's
-            // resolution - the shape the decoder stage actually runs its blocks
-            // at, which the encoder never visits at that channel count.
-            let key3 = (geo.width_at(ml), uh, uw);
-            if !scratch.contains_key(&key3) {
-                scratch.insert(key3, BlockScratch::new(cuda, geo.width_at(ml), uh, uw)?);
-            }
-            ch /= 2;
-            cw /= 2;
+        for (c, hh, ww) in &shape.scratch {
+            scratch.insert((*c, *hh, *ww), BlockScratch::new(pool.ptr, *c, *hh, *ww));
         }
-        // THE BARE `insert` HERE IS A FREE WAITING TO HAPPEN: `insert` returns the
-        // old value, and dropping a BlockScratch calls cuMemFree on every buffer
-        // in it - while the plan's slots still name the addresses the pass will
-        // read. The loops above guard with `contains_key`, this one did not, and
-        // the middle shape repeats a key whenever `middle_width() == 2 * width_at(0)`
-        // at the smallest spatial size.
-        let mid_key = (geo.middle_width(), ch, cw);
-        if !scratch.contains_key(&mid_key) {
-            scratch.insert(mid_key, BlockScratch::new(cuda, geo.middle_width(), ch, cw)?);
+        let mut slots = std::collections::HashMap::new();
+        for (n, c, hh, ww) in &shape.slots {
+            slots.insert(n.clone(), DA::new(*c, *hh, *ww)?);
         }
-        put("in", 3, h, wd)?;
-        put("intro", geo.width, h, wd)?;
-        put("ending", 3, h, wd)?;
-        // The decoder's activations reuse the encoder's slots by name, so the
-        // executor's slot set is exactly: in, intro, enc, skip, down, pre, up,
-        // ending - nothing else is allocated during the pass.
-        //
         // A slot whose `bytes` does not match its (c,h,w) is the failure mode
         // that made this plan necessary: a launch would then read or write past
         // the allocation, or a `copy_d2d` would name a range that is not there
@@ -1422,32 +1649,7 @@ impl Plan {
                 eprintln!("{n:10} c={} h={} w={} bytes={}", d.c, d.h, d.w, d.buf.bytes);
             }
         }
-        if std::env::var("NAFNET_DEBUG_VRAM").is_ok() {
-            let own: usize = slots.values().map(|d| d.buf.bytes).sum::<usize>()
-                + scratch
-                    .values()
-                    .map(|s| {
-                        s.t1.buf.bytes
-                            + s.t2.buf.bytes
-                            + s.t3.buf.bytes
-                            + s.t4.buf.bytes
-                            + s.t5.buf.bytes
-                            + s.g.buf.bytes
-                            + s.y.buf.bytes
-                            + s.pooled.bytes
-                            + s.att.buf.bytes
-                    })
-                    .sum::<usize>();
-            let free = lightgpu::vm::free_vram().unwrap_or(0);
-            eprintln!(
-                "plan owns {:.1} MiB in {} slots + {} scratch sets; {} MiB free",
-                own as f64 / 1048576.0,
-                slots.len(),
-                scratch.len(),
-                free / 1048576
-            );
-        }
-        Ok(Plan { slots, scratch })
+        Ok(Plan { _pool: pool, slots, scratch })
     }
 
     fn da(&self, name: &str) -> &DA {
@@ -1462,69 +1664,126 @@ impl Plan {
         })
     }
 
-    /// Copy the CONTENTS of one slot into another.
-    ///
-    /// NOT a pointer handoff: both slots keep their own allocation, so a slot's
-    /// (c,h,w) never changes identity. An earlier version re-pointed the name
-    /// instead, which is what made a `copy_d2d` name a range that did not exist
-    /// (the slot's metadata and its buffer disagreed) - and it also silently
-    /// destroyed the input slot the final residual add reads.
-    fn copy(&mut self, src: &str, dst: &str) -> Result<(), String> {
-        let (sp, sn, sb) = {
-            let s = self.slots.get(src).expect("copy source");
-            (s.buf.ptr, s.n(), s.buf.bytes)
-        };
-        let (dp, dn, db) = {
-            let d = self.slots.get(dst).expect("copy destination");
-            (d.buf.ptr, d.n(), d.buf.bytes)
-        };
-        if sn != dn || sn * 4 > sb || sn * 4 > db {
-            return Err(format!(
-                "copy {src} -> {dst}: {sn} floats into {dn} (buffers {sb} and {db} bytes)"
-            ));
-        }
-        copy_d2d(dp, sp, sn * 4).map_err(|e| format!("copy {src} -> {dst} ({sn} floats): {e}"))
-    }
 }
 
 /// The workspace ONE NAFBlock needs, at one shape. One set per distinct
 /// (c, h, w) in the plan, shared by every block that runs at that shape.
 ///
-/// FIELD NAMES ARE THE SAME NAMES `net::block_forward` USES, so the two
-/// implementations of the block can be read side by side; `t5` and `t4` are
-/// separate planes rather than one reused buffer because the residual kernel
-/// reads `t5` while writing the activation `t4` is no longer needed for.
-/// Sizing is by ROLE, not by the widest thing the shape could hold - see
-/// `BlockScratch::new`.
+/// THREE PLANES AND TWO VECTORS, WHICH IS THE LIVE SET AND NOT THE ROLE LIST -
+/// see `Gpu::block`, whose op order is the proof that each reuse is a reuse of a
+/// dead buffer. `t2` and `t3` are `2c`-wide so that one plane serves the
+/// width-`2c` roles and the width-`c` roles that follow them; `g` holds the first
+/// residual while the FFN runs; and `t1` is the FIRST HALF OF `t3`.
 struct BlockScratch {
+    /// norm1 output, then the sca-scaled gate, then norm2 output. A VIEW of
+    /// `t3`'s first half, never a plane of its own - see `Gpu::block` for the
+    /// three places `t3` is dead while `t1` is live.
     t1: DA,
+    /// conv1 output, then conv3 output, then conv4 output, then conv5 output.
     t2: DA,
+    /// dwconv output, then the FFN's gate product.
     t3: DA,
-    t4: DA,
-    t5: DA,
+    /// the SimpleGate product, which becomes `y` at the first residual.
     g: DA,
-    y: DA,
+    /// the global average pool, a `[c]` vector.
     pooled: DevBuf,
+    /// the sca 1x1 conv's output, a `[c][1][1]` activation.
     att: DA,
 }
 
+/// Floats one block's workspace needs at `(c, h, w)`: three `2c`-wide planes, one
+/// `c`-wide, and the two `[c]` vectors. The single source of the workspace
+/// arithmetic - `PlanShape::of` uses it for the reported total and `Plan::new`
+/// uses it to size the pool, so the number the engine reports and the bytes it
+/// allocates cannot disagree.
+fn workspace_floats(c: usize, h: usize, w: usize) -> usize {
+    // TWO `2c`-wide planes (`t2`, `t3`), ONE `c`-wide (`g`), and the two `[c]`
+    // vectors - 5c*hw + 2c, which is exactly the total `PlanShape::of` reports.
+    //
+    // `t1` IS NOT A PLANE OF ITS OWN: it is a view of `t3`'s first half. Every
+    // value `t1` holds - norm1's output, the sca-scaled gate, norm2's output - is
+    // `c` channels, and the op order in `Gpu::block` is the proof that `t3` is
+    // dead exactly when `t1` is first written and that `t1` is consumed before
+    // `t3` is written again. That is one plane at the block's shape, which is 512
+    // MiB at 2048x2048 level 0.
+    5 * c * h * w + 2 * c
+}
+
+/// The pre-shuffle staging shape at decoder level `l`.
+///
+/// `2 * c_before` CHANNELS AT HALF THE `up` SLOT'S RESOLUTION, where `c_before`
+/// is the width of the level ABOVE the mirrored one - `width_at(levels - l)`,
+/// except at `l = 0` where the input is the middle, `width_at(levels)`. Sizing it
+/// by `width_at(levels - 1 - l)` coincides at `l = 0` and is off by a factor of
+/// two everywhere else, which is why width 8 looked perfect and every larger
+/// width did not.
+///
+/// `PlanShape::of` and the pass both call this, so the slot the plan sizes and
+/// the view the decoder takes cannot drift apart.
+fn pre_shape(geo: &Geometry, h: usize, wd: usize, l: usize) -> (usize, usize, usize) {
+    let levels = geo.levels();
+    let ml = levels - 1 - l;
+    (
+        2 * geo.width_at(levels - l),
+        (h >> (ml + 1)).max(1),
+        (wd >> (ml + 1)).max(1),
+    )
+}
+
+/// The decoder's staging shape at level `l`: `width_at(levels-1-l)` channels at
+/// the encoder's level-(levels-1-l) resolution. The CPU reference's own dump
+/// fixes the rule - `ups.0 64 4 4`, `ups.1 32 8 8`, `ups.2 16 16 16`,
+/// `ups.3 8 32 32` - which is `(width_at(levels-1-l), h >> (levels-1-l), ...)`.
+/// Getting this wrong is not an error: the decoder runs, at the wrong
+/// resolution, and the output is a different image.
+fn up_shape(geo: &Geometry, h: usize, wd: usize, l: usize) -> (usize, usize, usize) {
+    let levels = geo.levels();
+    let ml = levels - 1 - l;
+    (geo.width_at(ml), (h >> ml).max(1), (wd >> ml).max(1))
+}
+
 impl BlockScratch {
-    /// The scratch for one block shape.
-    fn new(cuda: &Cuda, c: usize, h: usize, w: usize) -> Result<BlockScratch, String> {
+    /// The workspace for one block shape, as VIEWS into a pool.
+    ///
+    /// `base` is the pool's base pointer; nothing here owns its memory, so
+    /// nothing here may be dropped as an owner (see `DA`'s `Drop`). `Plan` owns
+    /// the pool for the whole pass.
+    ///
+    /// THE LAYOUT IS `t2 t3 g pooled att`, with `t2`/`t3` at `2c` channels, `g`
+    /// at `c`, and the two `[c]` vectors last. `t1` is a view of `t3`'s first
+    /// half and has no space of its own.
+    /// `workspace_floats` is the same arithmetic, and the two are checked against
+    /// each other by `Plan::new`'s size check.
+    fn new(base: u64, c: usize, h: usize, w: usize) -> BlockScratch {
         let dw = 2 * c;
-        let half = c;
-        Ok(BlockScratch {
-            t1: DA::new(c, h, w)?,
-            // `t2`/`t3` hold the 2c expansion; `t4` is the sca-scaled GATE
-            // (half the channels) and `t5` the branch output back at c.
-            t2: DA::new(dw, h, w)?,
-            t3: DA::new(dw, h, w)?,
-            t4: DA::new(half, h, w)?,
-            t5: DA::new(c, h, w)?,
-            g: DA::new(half, h, w)?,
-            y: DA::new(c, h, w)?,
-            pooled: cuda.buf(half)?,
-            att: DA::new(half, 1, 1)?,
-        })
+        let hw = h * w;
+        let plane = |ch: usize, off: usize| DA {
+            holds: false,
+            buf: DevBuf { ptr: base + (off * 4) as u64, bytes: ch * hw * 4 },
+            c: ch,
+            h,
+            w,
+            tag: "workspace",
+        };
+        BlockScratch {
+            // `t1` IS `t3`'s FIRST HALF. `t3` is `2c` wide and `t1` is `c`, and
+            // the two are never live at once - `Gpu::block` writes `t1` only
+            // after the gate product has been read out of `t3`, and consumes
+            // `t1` before the FFN writes `t3` again. So the two planes are one
+            // allocation and the block costs 5c*hw instead of 6c*hw.
+            t1: plane(c, 2 * c * hw),
+            t2: plane(dw, 0),
+            t3: plane(dw, 2 * c * hw),
+            g: plane(c, 4 * c * hw),
+            pooled: DevBuf { ptr: base + ((5 * c * hw) * 4) as u64, bytes: c * 4 },
+            att: DA {
+                holds: false,
+                buf: DevBuf { ptr: base + ((5 * c * hw + c) * 4) as u64, bytes: c * 4 },
+                c,
+                h: 1,
+                w: 1,
+                tag: "workspace att",
+            },
+        }
     }
 }

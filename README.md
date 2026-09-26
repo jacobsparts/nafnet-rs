@@ -124,35 +124,55 @@ success.
 
 ## Large images
 
-The whole image is resident on the device at once, so VRAM grows with the
-input. Every buffer the pass will use is allocated up front, which makes the
-requirement predictable rather than a matter of luck:
+The whole image is resident on the device at once, so VRAM grows with the input.
+Every buffer the pass will use is enumerated up front - as shapes, before a byte
+is allocated - which makes the requirement a number rather than a matter of luck:
 
-| checkpoint | 1280x853 | 1920x1080 | 2560x1440 |
-| --- | --- | --- | --- |
-| width 32 (Deblur/Denoise fast) | 3.6 GB | 6.7 GB | 11.9 GB |
-| width 64 (Deblur/Denoise best, Video Deblur) | 7.1 GB | 13.4 GB | 23.7 GB |
+| checkpoint | 1280x853 | 1920x1080 | 2560x1440 | 2048x2048 |
+| --- | --- | --- | --- | --- |
+| width 32 (Deblur/Denoise fast) | 1.2 GB | 2.3 GB | 4.0 GB | 4.6 GB |
+| width 64 (Deblur/Denoise best, Video Deblur) | 2.4 GB | 4.5 GB | 7.9 GB | 9.0 GB |
 
-Those are plan totals, and they are what the card must have FREE. On an 8 GB
-card that means the width-32 checkpoints run up to 1920x1080 and the width-64
-ones only to about 1344x752; past that the allocation fails. It is not a bug
-and there is no smaller setting - it is what running the whole image at once
-costs.
+Those are plan totals and they are what the card must have FREE. Three things
+keep them down, and none of them changes the arithmetic:
 
-So the failure is recovered rather than reported: **a pass that runs out of
-VRAM falls back to the CPU**, and says so on stderr:
+* the encoder's activation IS the skip the decoder reads back and IS the
+  downsample's destination, so one buffer carries three roles and the pass
+  contains no full-size copy at all;
+* the decoder's staging slots are ONE PAIR for every level, sized to the largest,
+  because the levels are strictly ordered - level `l` finishes reading before
+  level `l+1` writes;
+* every block shape shares ONE workspace pool sized to the largest, and inside a
+  block the four planes are the live set rather than the role list.
+
+On an 8 GB card the width-32 checkpoints run at every size the editor produces,
+up to and including 2048x2048 - which is what its Photo Box 2048 routine outputs
+- and the width-64 ones reach 2560x1440. 4K wants about 12 GB at width 32.
+
+### A pass that will not fit is refused, with the numbers
+
+There is no fallback. A plan larger than the free VRAM fails before it allocates
+anything, and says what it needed and what there was:
 
 ```
-nafnet: cuMemAlloc failed: CUDA_ERROR_OUT_OF_MEMORY
-nafnet: falling back to the CPU backend (--gpu forces the GPU)
-nafnet: 2048x1362 -> 2048x1362 in 9.30s
+nafnet: plan 24320 MiB (12032 activations + 12288 workspace), 7937 MiB free
+nafnet: not enough device memory for a 4096x4096 pass
+nafnet: the plan needs 24320 MiB (12032 activations + 12288 workspace); 7937 MiB is free
+nafnet: the plan is exact - it is what the driver would be asked for - so this is a hard limit, not a guess
+nafnet: a smaller image, a narrower checkpoint, or a freer card is what fits
 ```
 
-`--gpu` still refuses to fall back, for a caller who would rather fail than be
-quietly slow. The two backends agree to within 1/255 per channel, so the
-fallback changes the time and not the picture: on a 1920x1080 image, where both
-fit, the GPU takes 1.5 s and the CPU 6.6 s. The 2048x1362 run above spent 9.3 s
-and about 4 GB of host memory.
+The first line is printed on every GPU run, whether it fits or not, so which plan
+was used and against how much free memory is always on the record. Free VRAM is
+reported by the driver and can move by a gigabyte or two between runs on a
+machine whose desktop compositor is holding device memory, so the number is worth
+reading next to the plan rather than assuming.
+
+`--device cpu` runs the same network on the host. It is slower - 5.4 s against
+1.3 s on a 1920x1080 image - and it is guarded too: the CPU pass is refused
+before it starts if its modelled footprint will not fit in the machine's
+available memory, because a pass that runs a machine out of RAM does not fail,
+it swaps. The model is conservative by design, about 1.1x the measured peak.
 
 The input is padded up to a multiple of 16 by reflection, which is what the
 reference does.

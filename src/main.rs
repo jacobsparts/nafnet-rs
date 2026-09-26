@@ -9,6 +9,7 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 mod image;
+mod memguard;
 mod net;
 mod weights;
 #[cfg(feature = "cuda")]
@@ -237,6 +238,55 @@ fn run_cpu(
     w: usize,
     dump_path: Option<&str>,
 ) -> Result<Vec<f32>, String> {
+    // THE CPU PASS IS REFUSED BEFORE IT STARTS IF IT WILL NOT FIT IN HOST MEMORY.
+    // Same rule as the device side, for the same reason: a pass that runs the
+    // machine out of RAM does not fail, it SWAPS, and a machine that is swapping
+    // is worse off than one that was told no. There is no fallback here because
+    // there is nothing to fall back TO - this is the last backend.
+    //
+    // The check lives here rather than at the call sites so that every way of
+    // reaching the CPU - the default on a machine with no driver, `--device cpu`,
+    // and the no-cuda build - is covered by one copy of it.
+    let plan = memguard::CpuPlan::of(&weights.config, h, w);
+    let avail = memguard::host_available();
+    // REPORTED EITHER WAY, like the device plan: which pass is about to run and
+    // against how much memory is a property of the result. `nafnet:` prefix on
+    // the same terms as every other line of engine output.
+    match avail {
+        Some(a) => eprintln!(
+            "nafnet: cpu plan {} MiB ({} activations + {} workspace, plus {}% slack), {} MiB available",
+            plan.peak / 1048576,
+            plan.live / 1048576,
+            plan.scratch / 1048576,
+            ((memguard::SLACK - 1.0) * 100.0).round() as usize,
+            a / 1048576,
+        ),
+        None => eprintln!(
+            "nafnet: cpu plan {} MiB ({} activations + {} workspace)",
+            plan.peak / 1048576,
+            plan.live / 1048576,
+            plan.scratch / 1048576,
+        ),
+    }
+    if let Some(avail) = avail {
+        if plan.peak > avail {
+            return Err(format!(
+                "not enough memory for a {}x{} pass on the CPU\n\
+                 nafnet: it needs about {} MiB ({} of activations + {} of block workspace, \
+                 plus {}% for allocator slack); {} MiB is available\n\
+                 nafnet: that figure is a model, not a measurement - the CPU engine works in \
+                 buffers the allocator sizes, so it is close but not exact\n\
+                 nafnet: a smaller image, a narrower checkpoint, or the GPU engine is what fits",
+                w,
+                h,
+                plan.peak / 1048576,
+                plan.live / 1048576,
+                plan.scratch / 1048576,
+                ((memguard::SLACK - 1.0) * 100.0).round() as usize,
+                avail / 1048576,
+            ));
+        }
+    }
     #[cfg(feature = "dev")]
     let r = net::forward_cpu_maybe_dump(weights, plane, h, w, dump_path);
     // THE SINGLE CALL PATH FOR BOTH BUILDS, and the reason the dump path is a
@@ -622,34 +672,21 @@ fn main() {
                             }
                             v
                         }
-                        // A PASS THAT RAN OUT OF MEMORY IS THE SAME KIND OF EVENT
-                        // AS A DRIVER THAT WOULD NOT LOAD, and until this existed
-                        // it was the one hole left in that rule: the plan for a
-                        // large image can want more VRAM than the card has (see
-                        // `gpu::Plan`, which allocates every buffer of the pass up
-                        // front), so `cuMemAlloc` failing there exited 1 on a
-                        // machine whose CPU would have finished the job.
-                        Err(e) if force_gpu => {
-                            eprintln!("nafnet: {e}");
-                            std::process::exit(1);
-                        }
+                        // A FAILED PASS IS NOT RETRIED ON THE CPU, AND THAT IS
+                        // DELIBERATE. It was, for one commit: the plan for a
+                        // large image can want more VRAM than the card has, so a
+                        // memory failure switched to the CPU backend and finished
+                        // the job. That hid the reason - the reason is that the
+                        // image does not fit, which the caller can act on - and it
+                        // moved the failure somewhere worse, because the CPU twin
+                        // allocates several GB of host RAM, which on a machine
+                        // short of memory means swapping rather than an error.
+                        // `gpu::forward` now sizes the plan and refuses a pass
+                        // that cannot fit, with the numbers, before it allocates
+                        // anything at all.
                         Err(e) => {
                             eprintln!("nafnet: {e}");
-                            // the DEVICE BUFFERS GO BEFORE THE CPU PASS STARTS:
-                            // the plan holds the whole pass resident, and the CPU
-                            // twin then allocates several GB of its own, so the
-                            // two are never resident together.
-                            drop(g);
-                            eprintln!(
-                                "nafnet: falling back to the CPU backend (--gpu forces the GPU)"
-                            );
-                            match run_cpu(&weights, &input_plane, padded.h, padded.w, dumped) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("nafnet: {e}");
-                                    std::process::exit(1);
-                                }
-                            }
+                            std::process::exit(1);
                         }
                     }
                 }
