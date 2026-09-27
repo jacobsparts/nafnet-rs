@@ -26,7 +26,21 @@ use lightgpu::vm::{Module, DevBuf, Launch};
 /// only case it was resolved for.
 pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_conv3x3s1p1",
+    // THE TILED 3x3, promoted into the toolkit from ifan-rs. Same operator, same
+    // weight layout, DIFFERENT accumulation order (ci/ky/kx instead of ky/kx/ci)
+    // and the bias added after the sum rather than folded in first, so a swap is
+    // an arithmetic change of a few ulp and not a rename. It is resolved here so
+    // `--op-ab` can time it against `lg_conv3x3s1p1` at the graph's own two
+    // geometries; `Gpu::conv3x3` picks between them from an environment variable
+    // so the choice can be made on the whole forward pass rather than on a
+    // microbenchmark. See the note on `Gpu::conv3x3`.
+    "lg_conv3x3_tile",
     "lg_conv1x1",
+    // THE TILED 1x1, resolved for `NAFNET_CONV1X1=tile` - the toolkit's own
+    // measurement has it LOSING 0.7x at 64x64 and winning 4.1x where the output
+    // is very wide over a small plane, so `Gpu::conv1x1` routes to it only for a
+    // 1x1 whose output is wider than its input.
+    "lg_conv1x1_tile",
     "lg_channel_layer_norm",
     "lg_channel_mean",
     "lg_mul",

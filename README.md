@@ -205,6 +205,15 @@ same image. See Choosing a checkpoint.
 On both backends the largest single cost is the 1x1 convolution every NAFBlock
 uses four times, which is where the tiling effort went.
 
+The toolkit also carries a **tiled** 3x3 convolution (`lg_conv3x3_tile`), 5.5x
+the direct one at this graph's two 3x3 geometries - but those two are only 5.6%
+of the pass, so it is worth about 4.6% end to end and is **off by default**:
+`NAFNET_CONV3X3=tile` swaps it in, and `NAFNET_CONV1X1=tile` routes the
+bias-free pre-activation conversions to the tiled 1x1 as well. Both are
+arithmetic swaps rather than renames - the accumulation order differs, so an
+output PNG can differ by one 8-bit step - and the default path is the one the
+figures above were measured with. See docs/NUMERICS.md.
+
 ## Licence and attribution
 
 The Rust and CUDA code in this repository is licensed under the MIT license;

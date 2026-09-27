@@ -60,6 +60,15 @@ real 2-ulp bug when it changed, so they are not to be "tidied":
   swap would move the last bits of every downsample as well as changing the
   kernel.
 * `lg_channel_mean`'s summation order is fixed for the same reason.
+* The toolkit's tiled 3x3 (`lg_conv3x3_tile`), which `NAFNET_CONV3X3=tile` can
+  swap the graph's two 3x3s to, accumulates `ci`, then `ky`, then `kx` and adds
+  its bias AFTER the sum, where `lg_conv3x3s1p1` walks `ky`, `kx`, `ci` with the
+  bias folded in first. The channel tile has to be the outermost loop for the
+  staging to fit in shared memory, so the order is not a choice. Measured, this
+  is a few ulp: `--op-ab` puts the two 2.4e-06 to 2.7e-05 apart at the graph's
+  own two 3x3 geometries, and `--cuda-selftest` puts the tiled kernel 9.7e-07
+  (relative) from the CPU twin, against 0.0 for the direct one. It is a swap
+  under a magnitude bound, like `down2x2s2`, and NOT an equality swap.
 * `lg_channel_layer_norm`'s is *not* contractual, and its order changed
   deliberately when it was rewritten from one block per position to one thread
   per position.

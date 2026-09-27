@@ -15,6 +15,19 @@
 const TOOLKIT_KERNELS: &[&str] = &[
     // 3x3 pad-1 conv, the encoder/decoder input convs and `intro`/`ending`.
     "lg_conv3x3s1p1",
+    // THE TILED 1x1, also promoted from ifan-rs: for a very wide output over a
+    // small plane, where its channel blocking pays and the section-6 form's
+    // per-output-channel input walk does not. Compiled in for
+    // `NAFNET_CONV1X1=tile`, which routes only the PREACT conversions to it.
+    "lg_conv1x1_tile",
+    // THE TILED 3x3, promoted into the toolkit from ifan-rs: the same operator
+    // with shared-memory staging, a different accumulation order (ci/ky/kx) and
+    // the bias after the sum. Compiled in for the `--op-ab` comparison against
+    // `lg_conv3x3s1p1` and for `NAFNET_CONV3X3=tile`, which swaps the graph's two
+    // 3x3s. THIS LIST AND `src/cuda.rs`'s ARE SEPARATE ON PURPOSE - this one
+    // decides what nvcc embeds, that one what the module resolves - so a name
+    // added to only one of them fails at LAUNCH, the fatbin having pruned it.
+    "lg_conv3x3_tile",
     // 1x1 conv. NAFBlock is built out of four of them per block (conv1, conv3,
     // sca, conv4, conv5), so this is the model's most-called kernel by a wide
     // margin.

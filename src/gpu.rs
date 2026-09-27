@@ -258,6 +258,16 @@ pub struct Gpu {
     /// model is 17M parameters and re-uploading per launch would dominate.
     wdev: std::collections::HashMap<String, DevBuf>,
     pub profile: Option<Profile>,
+    /// `NAFNET_CONV3X3=tile` swaps the graph's two 3x3 convolutions to the
+    /// toolkit's tiled kernel. Read once, here, so that a whole forward pass
+    /// runs one way or the other and the two can be compared as images. See
+    /// `conv3x3`.
+    conv3x3_tile: bool,
+    /// `NAFNET_CONV1X1=tile` additionally routes the PREACT 1x1 conversions to
+    /// the toolkit's tiled 1x1 - where the graph's 1x1 output is wider than its
+    /// input, which is the case a tiled 1x1 can win. The gated branch and the SCA
+    /// stay on the project kernel either way. See `conv1x1`.
+    conv1x1_tile: bool,
 }
 
 impl Gpu {
@@ -280,6 +290,27 @@ impl Gpu {
             geo,
             wdev,
             profile: if profiling { Some(Profile::default()) } else { None },
+            // AN UNKNOWN VALUE IS AN ERROR RATHER THAN A SILENT DEFAULT. A
+            // mis-spelled switch that quietly runs the other kernel is a
+            // measurement that tests nothing, and this is a measurement device.
+            conv3x3_tile: match std::env::var("NAFNET_CONV3X3").as_deref() {
+                Ok("tile") => true,
+                Ok("direct") | Err(_) => false,
+                Ok(other) => {
+                    return Err(format!(
+                        "NAFNET_CONV3X3={other}: expected `direct` or `tile`"
+                    ))
+                }
+            },
+            conv1x1_tile: match std::env::var("NAFNET_CONV1X1").as_deref() {
+                Ok("tile") => true,
+                Ok("project") | Err(_) => false,
+                Ok(other) => {
+                    return Err(format!(
+                        "NAFNET_CONV1X1={other}: expected `project` or `tile`"
+                    ))
+                }
+            },
         })
     }
 
@@ -341,6 +372,40 @@ impl Gpu {
     /// The toolkit kernel stays listed and resolved: it is still what the
     /// selftest compares this one against.
     fn conv1x1(&self, input: &DA, w: &str, b: Option<&str>, c_in: usize, c_out: usize, out: &DA) -> Result<(), String> {
+        // THE TWO SHAPES THE TILED 1x1 DOES NOT WIN, ASKED FIRST. Its cost is the
+        // input re-read (`ceil(c_out / 32)` passes over the input), which only
+        // pays when the output is VERY wide relative to the plane; the toolkit's
+        // own measurement has it LOSING 0.7x at 64x64 against a winning 4.1x at
+        // 128 -> 15232. This graph's 1x1s are the opposite shape - a wide C_IN
+        // into a narrow C_out over a large plane (the gated branch, the SCA, the
+        // upsample's channel expansion) - where a channel-blocked kernel that
+        // re-reads the input is strictly worse. The condition is stated as the
+        // one the toolkit measured a LOSS at rather than as a tuned threshold.
+        let wide_out = c_out > c_in;
+        let small_plane = input.hw() < 128 * 128;
+        if self.conv1x1_tile && wide_out && !small_plane {
+            let bias = match b {
+                Some(n) => self.w(n)?,
+                None => 0,
+            };
+            let mut a = Args::new();
+            a.ptr(input.buf.ptr)
+                .ptr(self.w(w)?)
+                .ptr(bias)
+                .ptr(out.buf.ptr)
+                .i32(c_in as i32)
+                .i32(c_out as i32)
+                .i32(input.h as i32)
+                .i32(input.w as i32)
+                .i32(0)      // act: the graph's activations are separate ops
+                .f32(0.0);   // act_p, unused at act = 0
+            let grid = (
+                grid_for(input.w, 128).0,
+                (input.h as u32).div_ceil(4),
+                (c_out as u32).div_ceil(32),
+            );
+            return self.go("lg_conv1x1_tile", grid, (32, 4, 1), &mut a);
+        }
         let bias = match b {
             Some(n) => self.w(n)?,
             None => 0,
@@ -364,7 +429,32 @@ impl Gpu {
         self.go("nf_conv1x1_oc", grid, (BLOCK as u32, 1, 1), &mut a)
     }
 
-    /// 3x3 pad-1 conv: `lg_conv3x3s1p1(in, w, bias, out, c_in, c_out, h, wd)`.
+    /// 3x3 pad-1 conv. THE ONLY TWO CALL SITES ARE THE GRAPH'S EDGES - the
+    /// `intro` conv (3 -> width) of every NAFBlock's input and the `ending` conv
+    /// (width -> 3) - so this is where a toolkit 3x3 could pay for itself, and the
+    /// numbers that decide it are in `--op-ab`.
+    ///
+    /// TWO IMPLEMENTATIONS, CHOSEN BY `NAFNET_CONV3X3`:
+    ///
+    /// * `lg_conv3x3s1p1` (the default, `NAFNET_CONV3X3=direct`) - the toolkit's
+    ///   one-output-element-per-thread kernel, `ky`/`kx`/`ci` with the bias folded
+    ///   into the accumulator first. This is the arithmetic every number in
+    ///   `docs/NUMERICS.md` and every checkpoint's output PNG was produced with.
+    /// * `lg_conv3x3_tile` (`tile`) - the tiled form promoted into the toolkit from
+    ///   ifan-rs. Same operator and the same `[c_out][c_in][3][3]` weights, but the
+    ///   accumulation order is `ci`/`ky`/`kx` and the bias is added AFTER the sum,
+    ///   so it is NOT bit-compatible: it is a few ulp of arithmetic difference, the
+    ///   same kind of swap as `nf_down2x2s2` against `lg_conv2x2s2`.
+    ///
+    /// `--cuda-selftest` carries a row for the tiled kernel against this engine's
+    /// CPU `conv3x3` twin, so the ORDER is checked as well as the speed; the two
+    /// kernels' outputs are not compared directly because they are not supposed to
+    /// be equal.
+    ///
+    /// The switch is an environment variable rather than a flag because the
+    /// geometry is read straight off the tensors here and the caller passes no
+    /// per-call context: this way the whole forward pass - which is what is being
+    /// decided - can be run either way without threading a mode through the graph.
     fn conv3x3(&self, input: &DA, w: &str, b: Option<&str>, c_in: usize, c_out: usize, out: &DA) -> Result<(), String> {
         let bias = match b {
             Some(n) => self.w(n)?,
@@ -379,6 +469,17 @@ impl Gpu {
             .i32(c_out as i32)
             .i32(input.h as i32)
             .i32(input.w as i32);
+        if self.conv3x3_tile {
+            // act = 0: the graph's activations are separate ops, so nothing is
+            // fused here and the extra arguments are inert.
+            a.i32(0).f32(0.0);
+            let grid = (
+                grid_for(input.w, 128).0,
+                (input.h as u32).div_ceil(8),
+                (c_out as u32).div_ceil(8),
+            );
+            return self.go("lg_conv3x3_tile", grid, (32, 8, 1), &mut a);
+        }
         self.go("lg_conv3x3s1p1", grid_for(c_out * input.hw(), BLOCK), (BLOCK as u32, 1, 1), &mut a)
     }
 
@@ -1151,6 +1252,109 @@ impl Gpu {
             "  the ratios are ms_toolkit / ms_nafnet: above 1 the engine's kernel wins, below 1 the",
         );
         println!("  toolkit's does. A swap is an arithmetic change of a few ulp, not a rename.");
+
+        // THE 3x3, AT THE TWO GEOMETRIES THE GRAPH RUNS IT AT. `intro` lifts the
+        // 3-channel image to the block width and `ending` takes it back down, so
+        // these are 3->width and width->3 - the tiled form's WEAKEST channel
+        // counts, since what it buys comes from staging a channel tile and there
+        // is no channel tile to speak of at c_in = 3. Measuring a flattering
+        // 128->128 instead would answer a question the graph never asks.
+        //
+        // THE BLOCKS ARE NOT THE SAME, which is the whole reason this comparison
+        // is not a name swap: the direct kernel is `(BLOCK,1,1)` with one output
+        // element a thread, the tiled one is `(32,8,1)` with a 128x8 tile. Each is
+        // launched at ITS OWN geometry, so what is compared is the two kernels
+        // rather than one of them misconfigured.
+        println!();
+        println!("3x3:        lg_conv3x3s1p1 (toolkit: one output a thread, ky/kx/ci, bias first)");
+        println!("            lg_conv3x3_tile  (toolkit: tiled,          ci/ky/kx, bias last)");
+        println!("  {:<16} {:>10} {:>10} {:>8} {:>10}", "shape", "direct ms", "tile ms", "tile/", "max |d|");
+        let (h3, w3) = (512usize, 512usize);
+        let mut total3 = [0.0f64; 2];
+        for (what, c_in, c_out) in [
+            ("intro 3->width", 3usize, self.geo.width),
+            ("ending width->3", self.geo.width, 3usize),
+        ] {
+            let mut seed = 20_260_102u32 ^ ((c_in as u32) << 8) ^ c_out as u32;
+            let x = rng(&mut seed, c_in * h3 * w3);
+            let wt = rng(&mut seed, c_out * c_in * 9);
+            let bs = rng(&mut seed, c_out);
+            let xd = self.cuda.upload(&x)?;
+            let wd = self.cuda.upload(&wt)?;
+            let bd = self.cuda.upload(&bs)?;
+            let od = self.cuda.buf(c_out * h3 * w3)?;
+
+            // `lg_conv3x3s1p1(in, w, bias, out, c_in, c_out, h, wd)`
+            let mut ga = Args::new();
+            ga.ptr(xd.ptr).ptr(wd.ptr).ptr(bd.ptr).ptr(od.ptr)
+                .i32(c_in as i32).i32(c_out as i32).i32(h3 as i32).i32(w3 as i32);
+            let grid_a = grid_for(c_out * h3 * w3, BLOCK);
+            let block_a = (BLOCK as u32, 1, 1);
+
+            // `lg_conv3x3_tile(in, w, bias, out, c_in, c_out, h, wd, act, act_p)`
+            // - the same arguments with the two the fused activation added, and
+            // act = 0 because the graph's activations are separate ops and nothing
+            // is fused here.
+            let mut gb = Args::new();
+            gb.ptr(xd.ptr).ptr(wd.ptr).ptr(bd.ptr).ptr(od.ptr)
+                .i32(c_in as i32).i32(c_out as i32).i32(h3 as i32).i32(w3 as i32)
+                .i32(0).f32(0.0);
+            let grid_b = (
+                grid_for(w3, 128).0,
+                (h3 as u32).div_ceil(8),
+                (c_out as u32).div_ceil(8),
+            );
+            let block_b = (32u32, 8u32, 1u32);
+
+            let _ = self.cuda.run("lg_conv3x3s1p1", Launch::new(grid_a, block_a), &mut ga)?;
+            let _ = self.cuda.run("lg_conv3x3_tile", Launch::new(grid_b, block_b), &mut gb)?;
+            let mut best = [f64::MAX; 2];
+            for _ in 0..ROUNDS {
+                best[0] = best[0].min(time_launches(&self.cuda, "lg_conv3x3s1p1", grid_a, &mut ga, ITERS)?);
+                best[1] = best[1].min(time_launches_blk(&self.cuda, "lg_conv3x3_tile", grid_b, block_b, &mut gb, ITERS)?);
+            }
+            total3[0] += best[0];
+            total3[1] += best[1];
+
+            let _ = self.cuda.run("lg_conv3x3s1p1", Launch::new(grid_a, block_a), &mut ga)?;
+            let mut got = vec![0.0f32; c_out * h3 * w3];
+            od.download(&mut got)?;
+            let _ = self.cuda.run("lg_conv3x3_tile", Launch::new(grid_b, block_b), &mut gb)?;
+            let mut alt = vec![0.0f32; c_out * h3 * w3];
+            od.download(&mut alt)?;
+            let mut worst = 0.0f32;
+            let mut scale = 0.0f32;
+            for (a, b) in got.iter().zip(&alt) {
+                worst = worst.max((a - b).abs());
+                scale = scale.max(a.abs());
+            }
+            println!(
+                "  {what:<16} {:>10.3} {:>10.3} {:>8.2} {:>10.2e}",
+                best[0],
+                best[1],
+                best[0] / best[1],
+                worst
+            );
+            // NOT an equality check, and the threshold says so: a reordered sum is
+            // allowed to move the last bits, while a wrong tap order or a dropped
+            // halo would move the result by O(1).
+            if worst > 1e-3 * scale.max(1.0) {
+                println!(
+                    "  {:<16} {:>10} the two disagree by more than rounding (scale {:.3e})",
+                    "", "", scale
+                );
+            }
+        }
+        println!(
+            "  {:<16} {:>10.3} {:>10.3} {:>8.2}",
+            "TOTAL",
+            total3[0],
+            total3[1],
+            total3[0] / total3[1]
+        );
+        println!("  the ratio here is ms_direct / ms_tile: above 1 the TILED kernel is faster, and");
+        println!("  the sum is the whole forward pass's 3x3 time. What it does NOT show is the rest");
+        println!("  of the pass; run `NAFNET_CONV3X3=tile` against the default for that.");
         Ok(())
     }
 
@@ -1513,6 +1717,40 @@ impl Gpu {
             let mut want = vec![0.0f32; co * h * w];
             crate::net::conv3x3(&x, &wt, &bs, ci, co, h, w, &mut want);
             cmp_rel("lg_conv3x3s1p1@64x64x64", &got, &want, &mut rows, &mut fails);
+
+            // THE TILED 3x3, against the same CPU twin and at the same size. Its
+            // accumulation order is ci/ky/kx rather than ky/kx/ci and its bias is
+            // added after the sum rather than folded in first, so this is a
+            // relative comparison by construction - and that is exactly what is
+            // under test: a wrong tap order, a dropped halo or a bias applied
+            // twice would move the result far more than a reordered sum can.
+            // `co = 7` is not a multiple of the kernel's 8-channel tile, so the
+            // clamped read and the guarded store are exercised too.
+            for (co_t, tag) in [(7usize, "c_out%8!=0"), (co, "c_out%8==0")] {
+                let dout = DA::new(co_t, h, w)?;
+                let mut a = Args::new();
+                a.ptr(din.buf.ptr)
+                    .ptr(self.cuda.upload(&wt)?.ptr)
+                    .ptr(self.cuda.upload(&bs)?.ptr)
+                    .ptr(dout.buf.ptr)
+                    .i32(ci as i32)
+                    .i32(co_t as i32)
+                    .i32(h as i32)
+                    .i32(w as i32)
+                    .i32(0)
+                    .f32(0.0);
+                let grid = (
+                    grid_for(w, 128).0,
+                    (h as u32).div_ceil(8),
+                    (co_t as u32).div_ceil(8),
+                );
+                self.go("lg_conv3x3_tile", grid, (32, 8, 1), &mut a)?;
+                let mut got = vec![0.0f32; co_t * h * w];
+                dout.buf.download(&mut got)?;
+                let mut want = vec![0.0f32; co_t * h * w];
+                crate::net::conv3x3(&x, &wt, &bs, ci, co_t, h, w, &mut want);
+                cmp_rel(&format!("lg_conv3x3_tile {tag}"), &got, &want, &mut rows, &mut fails);
+            }
 
             // the depthwise 3x3, one channel per group, 9 terms per output
             let dwb = rng(co * h * w, 27);
@@ -1965,6 +2203,30 @@ fn time_launches(
     e0.record()?;
     for _ in 0..iters {
         cuda.run(name, Launch::new(grid, (BLOCK as u32, 1, 1)), args)?;
+    }
+    e1.record()?;
+    e1.synchronize()?;
+    Ok(e0.elapsed_ms(&e1)? as f64 / iters as f64)
+}
+
+/// The same, with an explicit BLOCK SHAPE: the tiled kernels are the reason it
+/// exists - `lg_conv3x3_tile` needs `(32,8,1)`, which is not this engine's
+/// `(BLOCK,1,1)`, and a launch at the wrong block would measure the wrong kernel
+/// while still returning numbers.
+#[cfg(feature = "dev")]
+fn time_launches_blk(
+    cuda: &Cuda,
+    name: &str,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    args: &mut Args,
+    iters: usize,
+) -> Result<f64, String> {
+    let e0 = Event::new()?;
+    let e1 = Event::new()?;
+    e0.record()?;
+    for _ in 0..iters {
+        cuda.run(name, Launch::new(grid, block), args)?;
     }
     e1.record()?;
     e1.synchronize()?;
