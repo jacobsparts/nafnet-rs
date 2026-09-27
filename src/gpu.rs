@@ -1005,6 +1005,161 @@ impl Gpu {
         Ok(())
     }
 
+    // ---- the stride-2 downsample A/B --------------------------------------
+
+    /// Time this engine's `nf_down2x2s2` against the toolkit's `lg_conv2x2s2` at
+    /// the real geometries the downsampled levels run at, in ONE window.
+    ///
+    /// WHY AN ARM OF ITS OWN RATHER THAN TWO FORWARD PASSES: on the released
+    /// width-32 checkpoints the four downsamples are a few percent of the pass,
+    /// and this card is shared and thermally throttled - it has swung between 139
+    /// and 1887 MHz across windows, which is a far larger effect than the one
+    /// under test. Alternating two kernels inside one window removes the clock
+    /// from the comparison and leaves the ratio.
+    ///
+    /// THE TWO ARE NOT THE SAME ARITHMETIC, and the last column says so: this
+    /// engine's kernel folds each `ic`'s four taps together (`ic` outer, taps
+    /// inner), the toolkit's walks `ky`, `kx` and then `ci`. That reassociation
+    /// moves the result by a few ulp, so a faster toolkit kernel is a DECISION
+    /// with a numerics cost, not a rename - which is why the two outputs are
+    /// compared here instead of assumed equal.
+    ///
+    /// DEVELOPMENT ONLY: `--op-ab`.
+    #[cfg(feature = "dev")]
+    pub fn op_ab(&self) -> Result<(), String> {
+        fn rng(seed: &mut u32, n: usize) -> Vec<f32> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                v.push(((*seed >> 8) as f32 / (1 << 24) as f32) * 2.0 - 1.0);
+            }
+            v
+        }
+        const ITERS: usize = 20;
+        const ROUNDS: usize = 3;
+        // The level geometries a 512x512 input produces, halving per level. This
+        // spans every `c_in`/`c_out` pair the released width-32 and width-64
+        // checkpoints run their downsamples at.
+        let (h0, w0) = (512usize, 512usize);
+        let levels = self.geo.levels();
+
+        println!("downsample: nf_down2x2s2 (this engine: {DW_OC_TILE} channels a thread, ic outer)");
+        println!("            lg_conv2x2s2  (toolkit:     8 channels a thread, ky/kx outer)");
+        println!(
+            "  {:<5} {:>11} {:>6} {:>6} {:>11} {:>11} {:>9} {:>10}",
+            "level", "in plane", "c_in", "c_out", "nafnet ms", "toolkit ms", "toolkit/", "max |d|"
+        );
+        let mut total = [0.0f64; 2];
+        for l in 0..levels {
+            let c_in = self.geo.width_at(l);
+            // The downsample doubles the width: `enc.{l+1}` is 2x `enc.{l}`, and
+            // the last level's target is `bottleneck`, also 2x.
+            let c_out = 2 * c_in;
+            let (h, w) = (h0 >> l, w0 >> l);
+            if h < 8 || w < 8 {
+                break;
+            }
+            let (oh, ow) = (h / 2, w / 2);
+            let mut seed = 20_260_101u32.wrapping_add(l as u32);
+            let x = rng(&mut seed, c_in * h * w);
+            let wt = rng(&mut seed, c_out * c_in * 4);
+            let bs = rng(&mut seed, c_out);
+            let xd = self.cuda.upload(&x)?;
+            let wd = self.cuda.upload(&wt)?;
+            let bd = self.cuda.upload(&bs)?;
+            let od = self.cuda.buf(c_out * oh * ow)?;
+            let ohw = oh * ow;
+
+            // THIS ENGINE'S KERNEL. Positions on x, channel tiles on y - the grid
+            // `downsample` launches at this geometry.
+            let mut ga = Args::new();
+            ga.ptr(xd.ptr)
+                .ptr(wd.ptr)
+                .ptr(bd.ptr)
+                .ptr(od.ptr)
+                .i32(c_in as i32)
+                .i32(c_out as i32)
+                .i32(h as i32)
+                .i32(w as i32);
+            let grid_a = (grid_for(ohw, BLOCK).0, c_out.div_ceil(DW_OC_TILE) as u32, 1);
+
+            // THE TOOLKIT'S. Same argument list and the same meaning, its own
+            // channel tile and its own block size.
+            let mut gb = Args::new();
+            gb.ptr(xd.ptr)
+                .ptr(wd.ptr)
+                .ptr(bd.ptr)
+                .ptr(od.ptr)
+                .i32(c_in as i32)
+                .i32(c_out as i32)
+                .i32(h as i32)
+                .i32(w as i32);
+            let grid_b = (grid_for(ohw, BLOCK).0, c_out.div_ceil(8) as u32, 1);
+
+            // Warm both, so the first round is not paying for a cold module.
+            self.run_once("nf_down2x2s2", grid_a, &mut ga)?;
+            self.run_once("lg_conv2x2s2", grid_b, &mut gb)?;
+            let mut best = [f64::MAX; 2];
+            for _ in 0..ROUNDS {
+                best[0] = best[0].min(time_launches(&self.cuda, "nf_down2x2s2", grid_a, &mut ga, ITERS)?);
+                best[1] = best[1].min(time_launches(&self.cuda, "lg_conv2x2s2", grid_b, &mut gb, ITERS)?);
+            }
+            total[0] += best[0];
+            total[1] += best[1];
+
+            // ONE RUN OF EACH, TO COMPARE THE NUMBERS AND NOT ONLY THE CLOCKS.
+            self.run_once("nf_down2x2s2", grid_a, &mut ga)?;
+            let mut got = vec![0.0f32; c_out * ohw];
+            od.download(&mut got)?;
+            self.run_once("lg_conv2x2s2", grid_b, &mut gb)?;
+            let mut alt = vec![0.0f32; c_out * ohw];
+            od.download(&mut alt)?;
+            let mut worst = 0.0f32;
+            let mut scale = 0.0f32;
+            for (a, b) in got.iter().zip(&alt) {
+                worst = worst.max((a - b).abs());
+                scale = scale.max(a.abs());
+            }
+
+            println!(
+                "  {l:<5} {:>5}x{:<5} {c_in:>6} {c_out:>6} {:>11.3} {:>11.3} {:>9.2} {:>10.2e}",
+                h,
+                w,
+                best[0],
+                best[1],
+                best[1] / best[0],
+                worst
+            );
+            if worst > 1e-3 * scale.max(1.0) {
+                println!(
+                    "  {:<5} {:>11} the two disagree by more than rounding (scale {:.3e})",
+                    "", "", scale
+                );
+            }
+        }
+        println!(
+            "  {:<5} {:>11} {:>6} {:>6} {:>11.3} {:>11.3} {:>9.2}",
+            "TOTAL",
+            "",
+            "",
+            "",
+            total[0],
+            total[1],
+            total[1] / total[0]
+        );
+        println!(
+            "  the ratios are ms_toolkit / ms_nafnet: above 1 the engine's kernel wins, below 1 the",
+        );
+        println!("  toolkit's does. A swap is an arithmetic change of a few ulp, not a rename.");
+        Ok(())
+    }
+
+    /// One launch, for the A/B's warm-up and for its output comparison.
+    #[cfg(feature = "dev")]
+    fn run_once(&self, name: &str, grid: (u32, u32, u32), args: &mut Args) -> Result<(), String> {
+        self.cuda.run(name, Launch::new(grid, (BLOCK as u32, 1, 1)), args)
+    }
+
     // ---- the selftest -----------------------------------------------------
 
     /// Compare every kernel this engine launches against its CPU twin on random
@@ -1786,4 +1941,32 @@ impl BlockScratch {
             },
         }
     }
+}
+
+/// Time `iters` launches of one kernel with CUDA events and return the mean in
+/// milliseconds.
+///
+/// WHY EVENTS AND NOT A HOST CLOCK, and why the pair brackets the whole loop:
+/// every launch here is asynchronous, so an `Instant` around one measures the
+/// cost of the CALL. Recording on the stream either side of the loop measures
+/// the work. The caller alternates the two arms through this function rather than
+/// measuring each once, because this card's clock has swung by more than 10x
+/// between windows.
+#[cfg(feature = "dev")]
+fn time_launches(
+    cuda: &Cuda,
+    name: &str,
+    grid: (u32, u32, u32),
+    args: &mut Args,
+    iters: usize,
+) -> Result<f64, String> {
+    let e0 = Event::new()?;
+    let e1 = Event::new()?;
+    e0.record()?;
+    for _ in 0..iters {
+        cuda.run(name, Launch::new(grid, (BLOCK as u32, 1, 1)), args)?;
+    }
+    e1.record()?;
+    e1.synchronize()?;
+    Ok(e0.elapsed_ms(&e1)? as f64 / iters as f64)
 }

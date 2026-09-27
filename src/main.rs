@@ -50,6 +50,9 @@ DEVELOPMENT ONLY (this build has `--features dev`; a release build has none of
 these, and rejects them by name):
         --cuda-selftest   compare each CUDA kernel against its CPU twin, at real
                           sizes and a relative tolerance, and exit
+        --op-ab           time this engine's kernels against the toolkit kernels
+                          that could replace them, at the graph's own geometries,
+                          interleaved inside one clock window, and exit
         --profile         report per-kernel GPU time, longest first (CUDA event
                           pairs around every launch). On the CPU path, set
                           NAFNET_CPU_PROFILE=1 for the per-op table - there is no
@@ -372,6 +375,8 @@ fn main() {
     let mut size: Option<(usize, usize)> = None;
     #[cfg(feature = "dev")]
     let mut cuda_selftest = false;
+    #[cfg(feature = "dev")]
+    let mut op_ab = false;
     // A RELEASE BUILD HAS NO FLAG THAT SETS THIS, so for the GPU branch it is not
     // a runtime choice - it is the constant the compiler folds into the launch
     // path. PROFILING IS ALSO A GPU CONCERN: there is no launch to time in a
@@ -425,6 +430,10 @@ fn main() {
             }
             #[cfg(feature = "dev")]
             "--cuda-selftest" => cuda_selftest = true,
+            // The per-op A/B: one kernel of this engine against the toolkit
+            // kernel that could replace it, at the geometries the graph runs.
+            #[cfg(feature = "dev")]
+            "--op-ab" => op_ab = true,
             #[cfg(feature = "dev")]
             "--profile" => profile = true,
             // `--tile` IS NOT A DEVELOPMENT FLAG, IT IS NOT AN OPTION AT ALL.
@@ -441,10 +450,10 @@ fn main() {
             // name rather than ignored - a script that asked for a dump and did
             // not get one must not carry on as if it had.
             #[cfg(not(feature = "dev"))]
-            "--dump" | "--raw" | "--size" | "--cuda-selftest" | "--profile" | "--pad" => {
+            "--dump" | "--raw" | "--size" | "--cuda-selftest" | "--profile" | "--pad" | "--op-ab" => {
                 eprintln!("nafnet: `{a}` is a development flag and this is a release build");
                 eprintln!("nafnet: rebuild with `cargo build --release --features dev` for --dump,");
-                eprintln!("nafnet: --raw, --size, --cuda-selftest, --profile and --pad");
+                eprintln!("nafnet: --raw, --size, --cuda-selftest, --profile, --op-ab and --pad");
                 std::process::exit(2);
             }
             "-h" | "--help" => usage(),
@@ -500,6 +509,33 @@ fn main() {
         dec_blk_nums: cfg.dec_blk_nums.clone(),
     };
     let mult = geo.padder_size();
+
+    #[cfg(all(feature = "cuda", feature = "dev"))]
+    if op_ab {
+        // The Gpu is what holds the uploaded weights and the device, and the A/B
+        // needs only random tensors - so the checkpoint it was built from is
+        // irrelevant to the measurement, which is the point: the shapes are the
+        // geometry's, not the model's.
+        let g = match gpu::Gpu::with_profile(&weights, geo.clone(), false) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("nafnet: {e}");
+                std::process::exit(1);
+            }
+        };
+        match g.op_ab() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("nafnet: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(all(not(feature = "cuda"), feature = "dev"))]
+    if op_ab {
+        eprintln!("nafnet: --op-ab needs a build with the cuda feature");
+        std::process::exit(2);
+    }
 
     #[cfg(all(feature = "cuda", feature = "dev"))]
     if cuda_selftest {

@@ -35,13 +35,26 @@ const TOOLKIT_KERNELS: &[&str] = &[
     "lg_channel_scale",
     "lg_add",
     "lg_add_scaled",
+    // The toolkit's stride-2 2x2 downsample, promoted from scunet-rs. Compiled in
+    // for the `--op-ab` comparison against this engine's `nf_down2x2s2`; if that
+    // measurement goes the toolkit's way, this entry moves down to the graph.
+    "lg_conv2x2s2",
 ];
 
-/// This project's own kernels, in `cuda/nafnet.cu`. Both are ops the toolkit
-/// does not have: a grouped/depthwise convolution (`conv2` is 3x3 with
-/// `groups = 2*width`, one weight set per channel) and the DEPTH-TO-SPACE
-/// direction of PixelShuffle. The toolkit's `lg_pixel_unshuffle2` is the
-/// opposite direction, so neither is a duplicate of anything shared.
+/// This project's own kernels, in `cuda/nafnet.cu`: a grouped/depthwise
+/// convolution (`conv2` is 3x3 with `groups = 2*width`, one weight set per
+/// channel), the DEPTH-TO-SPACE direction of PixelShuffle (the toolkit's
+/// `lg_pixel_unshuffle2` is the opposite direction, so it is not a duplicate),
+/// the per-thread-tile 1x1 (`lg_conv1x1` reads an activation once per output
+/// channel, which is what `nf_conv1x1_oc` fixes) and the fused per-channel
+/// residual scale. `nf_down2x2s2` is the one entry here with a toolkit
+/// counterpart, `lg_conv2x2s2`, and it STAYS: `--op-ab` measured the two
+/// interleaved at this engine's four downsample geometries (a 512x512 input at
+/// width 32) and the project kernel won every one - 1.377/1.277/1.235/1.281 ms
+/// against 2.338/2.354/1.640/1.594, 1.53x summed - because its 16 accumulators
+/// halve the input re-reads where the toolkit's 8 do not. The two differ by a few
+/// ulp on the last bits (the toolkit sums `ky`, `kx` then `ci`, this kernel folds
+/// each `ic`'s four taps together), which docs/NUMERICS.md records.
 const PROJECT_KERNELS: &[&str] = &[
     "nf_conv3x3_dw",
     "nf_pixel_shuffle2",

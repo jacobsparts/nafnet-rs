@@ -53,7 +53,12 @@ real 2-ulp bug when it changed, so they are not to be "tidied":
 * `conv3x3` accumulates `ky`, then `kx`, then `ic`.
 * `conv3x3_dw` accumulates `ky`, then `kx`.
 * `down2x2s2` keeps `acc := bias` and then four fused per-`ic` accumulates in
-  (ky, kx) order.
+  (ky, kx) order. This is ALSO what keeps the project kernel ahead of the
+  toolkit's `lg_conv2x2s2`: `--op-ab` shows the two disagreeing by a few ulp
+  (max |d| 1.0e-5 to 7.3e-5 at the four geometries a 512x512 width-32 input
+  produces) because the toolkit walks `ky`, `kx` and then `ci` instead, so a
+  swap would move the last bits of every downsample as well as changing the
+  kernel.
 * `lg_channel_mean`'s summation order is fixed for the same reason.
 * `lg_channel_layer_norm`'s is *not* contractual, and its order changed
   deliberately when it was rewritten from one block per position to one thread

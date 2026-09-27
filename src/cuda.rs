@@ -32,6 +32,11 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_mul",
     "lg_channel_scale",
     "lg_add",
+    // STRIDE-2 2x2 DOWNSAMPLE. Resolved only so `--op-ab` can time it against
+    // this engine's `nf_down2x2s2`; the graph still launches the project kernel
+    // until that comparison says otherwise. A name this list does not carry
+    // cannot be launched at all, which is the point of the list.
+    "lg_conv2x2s2",
 ];
 
 /// This project's own kernels, from `cuda/nafnet.cu`.
