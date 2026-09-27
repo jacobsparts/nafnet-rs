@@ -48,8 +48,13 @@ run on the CPU; they differ only in whether CUDA support is compiled in.
 | 5 `*.safetensors` checkpoints | deblur (GoPro, REDS) and denoise (SIDD), width 32 and 64 | see Choosing a checkpoint |
 
 ```sh
+chmod +x nafnet-linux-x86_64
 ./nafnet-linux-x86_64 -m nafnet-gopro-width32.safetensors -i blurry.png -o sharp.png
 ```
+
+The `chmod` is not decoration: a download does not carry the executable
+bit through, and a binary that has lost it fails with `Permission denied`
+before it can print anything.
 
 ## Build
 
