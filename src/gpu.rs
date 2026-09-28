@@ -659,14 +659,25 @@ impl Gpu {
         self.go("lg_add", grid_for(n, BLOCK), (BLOCK as u32, 1, 1), &mut a)
     }
 
-    /// Depth-to-space (project kernel): `nf_pixel_shuffle2(in, out, c, h, wd)`.
+    /// Depth-to-space, `nn.PixelShuffle(2)`: the toolkit's `lg_pixel_shuffle(in,
+    /// out, c, h, wd, 2)`, whose `r` is a runtime argument and whose r == 2 path is
+    /// the shift form.
+    ///
+    /// This was the project kernel `nf_pixel_shuffle2` until the forward form was
+    /// promoted into the toolkit as `lg_pixel_shuffle` (the toolkit had only
+    /// `lg_pixel_unshuffle2`, its inverse, and three engines had written this half
+    /// privately). The launch is UNCHANGED - `lg_pixel_shuffle` uses the same 32x8
+    /// block with the output channel in `blockIdx.z` that this kernel did, because
+    /// that shape is what the promotion kept - and the A/B was an interleaved tie
+    /// (0.0205 ms each at [32][64][64], 0.0287 at the head's 3-channel geometry).
     fn pixel_shuffle2(&self, input: &DA, c: usize, out: &DA) -> Result<(), String> {
         let (h, wd) = (input.h, input.w);
         let (oh, ow) = (2 * h, 2 * wd);
         let mut a = Args::new();
-        a.ptr(input.buf.ptr).ptr(out.buf.ptr).i32(c as i32).i32(h as i32).i32(wd as i32);
+        a.ptr(input.buf.ptr).ptr(out.buf.ptr).i32(c as i32).i32(h as i32).i32(wd as i32)
+            .i32(2);
         let grid = (ow.div_ceil(TX) as u32, oh.div_ceil(TY) as u32, c as u32);
-        self.go("nf_pixel_shuffle2", grid, (TX as u32, TY as u32, 1), &mut a)
+        self.go("lg_pixel_shuffle", grid, (TX as u32, TY as u32, 1), &mut a)
     }
 
     /// A sub-view of a device buffer, as an activation. The buffers the block
@@ -1787,7 +1798,7 @@ impl Gpu {
             dout.buf.download(&mut got)?;
             let mut want = vec![0.0f32; c * 4 * h * w];
             crate::net::pixel_shuffle2(&x, c, h, w, &mut want);
-            cmp("nf_pixel_shuffle2", &got, &want, &mut rows, &mut fails);
+            cmp("lg_pixel_shuffle (pixel_shuffle2)", &got, &want, &mut rows, &mut fails);
 
             let (ci, co, h, w) = (3usize, 5usize, 8usize, 6usize);
             let x = rng(ci * h * w, 15);

@@ -1,12 +1,18 @@
-//! NAFNet's own kernels: the two ops the lightgpu toolkit does not have.
+//! NAFNet's own kernels: the ops the lightgpu toolkit does not have.
 //!
 //! Everything else this engine runs is a toolkit kernel (`lg_conv3x3s1p1`,
 //! `lg_conv1x1`, `lg_channel_layer_norm`, `lg_channel_mean`, `lg_mul`,
-//! `lg_channel_scale`, `lg_add`, `lg_add_scaled`). These two are here because
-//! the family had no grouped/depthwise convolution anywhere and no
-//! depth-to-space PixelShuffle - the toolkit's `lg_pixel_unshuffle2` is the
-//! OPPOSITE direction - so neither is a duplicate of anything shared. They move
-//! into the toolkit the moment a second family needs them (docs/MAINTAINING.md).
+//! `lg_channel_scale`, `lg_add`, `lg_add_scaled`, `lg_conv2x2s2`). These are here
+//! because the family had no grouped/depthwise convolution anywhere, and because
+//! the 1x1 and the residual are tiled and fused in ways the toolkit's own forms
+//! are not. Each stays until an interleaved A/B says otherwise, and
+//! `nf_down2x2s2` already has that measurement recorded in build.rs.
+//!
+//! WHAT USED TO BE HERE: `nf_pixel_shuffle2`, depth-to-space. The toolkit had
+//! only its INVERSE (`lg_pixel_unshuffle2`) and three engines had written this
+//! half privately, so it was promoted as `lg_pixel_shuffle` - whose r == 2 path
+//! is the same 32x8, channel-in-blockIdx.z launch this kernel used, verified as
+//! an interleaved tie before the kernel was deleted.
 //!
 //! Both follow cuda/CONVENTIONS.md: `extern "C" __global__`, the engine's prefix,
 //! raw pointers and scalars only, `const T *__restrict__` in / `T *__restrict__`
@@ -103,47 +109,6 @@ extern "C" __global__ void nf_conv3x3_dw(
     op[(long)oy * wd + ox] = acc;
 }
 
-// ---------------------------------------------------------------------------
-// nf_pixel_shuffle2 - depth-to-space, the inverse of the toolkit's
-// lg_pixel_unshuffle2.
-//
-//   in  [C * 4][h][wd]  ->  out [C][2*h][2*wd]
-//   out[c][2*y + dy][2*x + dx] = in[c * 4 + dy * 2 + dx][y][x]
-//
-// THE PERMUTATION IS THE CONTRACT, not just the shape: the 1x1 conv that
-// precedes this op orders its output channels by it, so a different tap order
-// produces a plausible image from the wrong weights. This matches PyTorch's
-// `nn.PixelShuffle(2)`, whose channel order is `c * r^2 + dy * r + dx` for
-// output (c, y*r + dy, x*r + dx).
-//
-// One output pixel per thread, block 32x8, grid (ceil(2*wd/32), ceil(2*h/8),
-// C). The gather is a single load per output element: the four source values
-// that land in a 2x2 output neighbourhood are four different channels, and
-// staging them would cost more than the load.
-// ---------------------------------------------------------------------------
-
-extern "C" __global__ void nf_pixel_shuffle2(
-    const float *__restrict__ in,
-    float *__restrict__ out,
-    int c,
-    int h,
-    int wd)
-{
-    const int C = blockIdx.z;
-    const int oy = blockIdx.y * NF_DW_TY + threadIdx.y;
-    const int ox = blockIdx.x * NF_DW_TX + threadIdx.x;
-    const int oh = h * 2;
-    const int ow = wd * 2;
-    if (C >= c || oy >= oh || ox >= ow) return;
-
-    const int y = oy >> 1;
-    const int x = ox >> 1;
-    const int dy = oy & 1;
-    const int dx = ox & 1;
-
-    const long src = ((long)(C * 4 + dy * 2 + dx) * h + y) * wd + x;
-    out[((long)C * oh + oy) * ow + ox] = in[src];
-}
 
 // ---------------------------------------------------------------------------
 // nf_down2x2s2 - stride-2 2x2 convolution, no padding. The encoder's downsample

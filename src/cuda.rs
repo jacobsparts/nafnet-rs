@@ -55,7 +55,7 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
 
 /// This project's own kernels, from `cuda/nafnet.cu`.
 pub const PROJECT_KERNELS: &[&str] =
-    &["nf_conv3x3_dw", "nf_pixel_shuffle2", "nf_down2x2s2", "nf_conv1x1_oc", "nf_residual"];
+    &["nf_conv3x3_dw", "nf_down2x2s2", "nf_conv1x1_oc", "nf_residual"];
 
 const TOOLKIT_FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nafnet_toolkit.fatbin"));
 const PROJECT_FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nafnet_project.fatbin"));
